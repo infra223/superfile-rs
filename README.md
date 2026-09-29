@@ -1,8 +1,12 @@
 # superfileR
 
-A terminal file manager written in Rust — a reimplementation of
-[superfile](https://github.com/yorukot/superfile) v1.6.0, built for full
-feature parity.
+A terminal file manager written in Rust. This is an **experimental**
+reimplementation/translation of
+[superfile](https://github.com/yorukot/superfile) v1.6.0 (written in Go),
+developed with the help of local LLMs.
+
+The project's intention is to keep full feature parity with the original
+Go-based project.
 
 The binary is `spf`.
 
