@@ -13,6 +13,7 @@ Go-based project and experiment with the models ability to translate from Go to 
 For all feature requests and enhancements please contact the original project.  
 Bug reports and fixes related to defects from the translation are welcome.
 
+This is **EXPERIMENTAL**, use at own risk.
 
 ## Features
 
