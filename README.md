@@ -1,6 +1,6 @@
 # superfileR
 
-A terminal file manager written in Rust. This is an **experimental**
+A terminal file manager translated in Rust. This is an **experimental**
 reimplementation/translation of
 [superfile](https://github.com/yorukot/superfile) v1.6.0 (written in Go),
 developed with the help of local LLMs — specifically
@@ -11,7 +11,7 @@ The project's intention is to keep full feature parity with the original
 Go-based project and experiment with the models ability to translate from Go to Rust.
 
 For all feature requests and enhancements please contact the original project.  
-Bug reports and fixes related to the defects from the translation are welcome.
+Bug reports and fixes related to defects from the translation are welcome.
 
 
 ## Features
