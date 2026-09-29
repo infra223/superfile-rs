@@ -3,7 +3,9 @@
 A terminal file manager written in Rust. This is an **experimental**
 reimplementation/translation of
 [superfile](https://github.com/yorukot/superfile) v1.6.0 (written in Go),
-developed with the help of local LLMs.
+developed with the help of local LLMs — specifically
+Qwen3.8 27B (Q5_K_XL quantization, running locally via llama.cpp) —
+driven by the [OpenCode](https://opencode.ai) coding agent.
 
 The project's intention is to keep full feature parity with the original
 Go-based project.
