@@ -8,9 +8,11 @@ Qwen3.8 27B (Q5_K_XL quantization, running locally via llama.cpp) —
 driven by the [OpenCode](https://opencode.ai) coding agent.
 
 The project's intention is to keep full feature parity with the original
-Go-based project.
+Go-based project and experiment with the models ability to translate from Go to Rust.
 
-The binary is `spf`.
+For all feature requests and enhancements please contact the original project.  
+Bug reports and fixes related to the defects from the translation are welcome.
+
 
 ## Features
 
