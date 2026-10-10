@@ -27,7 +27,7 @@ pub struct Entry {
 
 impl Entry {
     /// Lower-cased extension without the dot ("" when absent).
-    pub fn ext(&self) -> std::borrow::Cow<str> {
+    pub fn ext(&self) -> std::borrow::Cow<'_, str> {
         match self.path.extension() {
             Some(e) => std::borrow::Cow::Owned(e.to_string_lossy().to_ascii_lowercase()),
             None => std::borrow::Cow::Borrowed(""),
@@ -86,6 +86,9 @@ pub fn parent_of(p: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Delete/Create/Compress/Extract are constructed by the delete/create/
+// compress/extract triggers (later Task B tasks).
+#[allow(dead_code)]
 pub enum OpKind {
     Copy,
     Cut,
@@ -96,6 +99,7 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    #[allow(dead_code)] // reserved for process-bar labels
     pub fn label(&self) -> &'static str {
         match self {
             OpKind::Copy => "copy",
@@ -129,6 +133,13 @@ pub enum WorkerMsg {
 
 /// Spawn a worker running `kind` over `items` (paths). `dest` is the
 /// destination directory for copy/cut/create. Reports via `tx`.
+///
+/// Progress semantics (Go `makePasteProcessor` + `actualPasteOperation`, R2):
+/// Copy and cross-device Cut report one `Progress` per copied file
+/// (`file = base(path)`, absolute `done`/`total` where total is the recursive
+/// file count); same-device Cut uses the fast whole-tree rename with no
+/// per-file progress. Every op ends with a final `Progress { done: total }`
+/// (Go `process.Done = process.Total` before `markProcessDone`).
 pub fn spawn_worker(
     kind: OpKind,
     op_id: u64,
@@ -137,27 +148,58 @@ pub fn spawn_worker(
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
 ) {
-    let total = items.len();
+    let total: usize = match kind {
+        OpKind::Copy | OpKind::Cut => items.iter().map(|p| count_files(p)).sum(),
+        _ => items.len(),
+    };
     std::thread::spawn(move || {
+        fn progress_cb<'a>(
+            tx: &'a Sender<WorkerMsg>,
+            op_id: u64,
+            done: &'a mut usize,
+            total: usize,
+        ) -> impl FnMut(&Path) + 'a {
+            move |p: &Path| {
+                *done += 1;
+                let _ = tx.send(WorkerMsg::Progress {
+                    op: op_id,
+                    file: base_name(p),
+                    done: *done,
+                    total,
+                });
+            }
+        }
+
+        let mut done: usize = 0;
         for (i, item) in items.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerMsg::Done { op: op_id });
                 return;
             }
             let res: Result<(), String> = match kind {
-                OpKind::Copy => copy_item(item, &dest).map_err(|e| e.to_string()),
-                OpKind::Cut => move_item(item, &dest).map_err(|e| e.to_string()),
-                OpKind::Delete => delete_item(item, true).map_err(|e| e.to_string()),
-                OpKind::Create => create_item(item).map_err(|e| e.to_string()),
-                OpKind::Compress => compress_items(&[item.clone()], &dest).map(|_| ()).map_err(|e| e.to_string()),
-                OpKind::Extract => extract_archive(item).map(|_| ()).map_err(|e| e.to_string()),
+                OpKind::Copy => copy_item(item, &dest, Some(&mut progress_cb(&tx, op_id, &mut done, total)))
+                    .map_err(|e| e.to_string()),
+                OpKind::Cut => {
+                    if is_same_partition(item, &dest) {
+                        // Fast whole-tree rename; no per-file progress (R2).
+                        move_item(item, &dest, None).map_err(|e| e.to_string())
+                    } else {
+                        move_item(item, &dest, Some(&mut progress_cb(&tx, op_id, &mut done, total)))
+                            .map_err(|e| e.to_string())
+                    }
+                }
+                OpKind::Delete => delete_item(item, true).map_err(|e| e.to_string()).map(|_| done += 1),
+                OpKind::Create => create_item(item).map_err(|e| e.to_string()).map(|_| done += 1),
+                OpKind::Compress => compress_items(&[item.clone()], &dest).map(|_| done += 1).map_err(|e| e.to_string()),
+                OpKind::Extract => extract_archive(item).map(|_| done += 1).map_err(|e| e.to_string()),
             };
             match res {
                 Ok(()) => {
+                    // Go: process.CurrentFile = base(filePath); TrySendingUpdateProcessMsg
                     let _ = tx.send(WorkerMsg::Progress {
                         op: op_id,
-                        file: item.display().to_string(),
-                        done: i + 1,
+                        file: base_name(item),
+                        done,
                         total,
                     });
                 }
@@ -176,11 +218,19 @@ pub fn spawn_worker(
                 }
             }
         }
+        let last_file = items.last().map(|p| base_name(p)).unwrap_or_default();
+        let _ = tx.send(WorkerMsg::Progress {
+            op: op_id,
+            file: last_file,
+            done: total,
+            total,
+        });
         let _ = tx.send(WorkerMsg::Done { op: op_id });
     });
 }
 
 /// Re-run a worker on the remaining items after the user pressed "Skip".
+#[allow(dead_code)] // wired by the skip/abort flow (Task 3)
 pub fn spawn_remaining(
     kind: OpKind,
     op_id: u64,
@@ -198,27 +248,35 @@ pub fn spawn_remaining(
 // ---------------------------------------------------------------------------
 
 /// Copy `src` into directory `dest` (creating `dest/name`). Handles symlinks
-/// with `cp -P` semantics and preserves permissions.
-pub fn copy_item(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
+/// with `cp -P` semantics and preserves permissions. `progress` is invoked
+/// once per copied file/symlink (Go `actualPasteOperation`'s `p.Done++`).
+pub fn copy_item(src: &Path, dest_dir: &Path, progress: Option<&mut dyn FnMut(&Path)>) -> std::io::Result<()> {
+    let mut sink = |_p: &Path| {};
+    let mut cb: &mut dyn FnMut(&Path) = match progress {
+        Some(f) => f,
+        None => &mut sink,
+    };
     let name = src.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
     let target = unique_target(dest_dir.join(name));
     let lmeta = std::fs::symlink_metadata(src)?;
     if lmeta.file_type().is_symlink() {
         let link = std::fs::read_link(src)?;
         std::os::unix::fs::symlink(link, &target)?;
+        cb(src);
         return Ok(());
     }
     if lmeta.is_dir() {
-        copy_dir_recursive(src, &target)?;
+        copy_dir_recursive(src, &target, &mut cb)?;
     } else {
         let perm = lmeta.permissions();
         std::fs::copy(src, &target)?;
         std::fs::set_permissions(&target, perm)?;
+        cb(src);
     }
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir_recursive(src: &Path, dst: &Path, mut progress: &mut dyn FnMut(&Path)) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     let src_perm = std::fs::metadata(src)?.permissions();
     std::fs::set_permissions(dst, src_perm)?;
@@ -229,25 +287,33 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if lmeta.file_type().is_symlink() {
             let link = std::fs::read_link(&sp)?;
             std::os::unix::fs::symlink(link, &dp)?;
+            progress(&sp);
         } else if lmeta.is_dir() {
-            copy_dir_recursive(&sp, &dp)?;
+            copy_dir_recursive(&sp, &dp, &mut progress)?;
         } else {
             std::fs::copy(&sp, &dp)?;
             std::fs::set_permissions(&dp, lmeta.permissions())?;
+            progress(&sp);
         }
     }
     Ok(())
 }
 
-/// Move `src` into `dest_dir`. Uses rename when possible, else copy+remove.
-pub fn move_item(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
+/// Move `src` into `dest_dir`. Uses rename when possible, else copy+remove
+/// (Go `moveElement`). `progress` is invoked per copied file on the
+/// copy+remove path only (the rename fast path has no per-file progress).
+pub fn move_item(src: &Path, dest_dir: &Path, progress: Option<&mut dyn FnMut(&Path)>) -> std::io::Result<()> {
     let name = src.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
     let target = unique_target(dest_dir.join(name));
     if std::fs::rename(src, &target).is_ok() {
         return Ok(());
     }
-    copy_item(src, dest_dir)?;
-    std::fs::remove_dir_all(src)
+    copy_item(src, dest_dir, progress)?;
+    if src.is_dir() && !src.is_symlink() {
+        std::fs::remove_dir_all(src)
+    } else {
+        std::fs::remove_file(src)
+    }
 }
 
 /// Create a file or directory. A trailing `/` makes it a directory.
@@ -298,6 +364,7 @@ pub fn trash_root() -> Option<PathBuf> {
 }
 
 /// True when the trash is available (drives the confirmation wording).
+#[allow(dead_code)] // used by the delete confirmation flow (Task 2)
 pub fn has_trash() -> bool {
     trash_root().is_some()
 }
@@ -327,8 +394,11 @@ pub fn trash_move(src: &Path) -> std::io::Result<()> {
 // Zip / extract
 // ---------------------------------------------------------------------------
 
+// Consumed by the compress/extract triggers (Task 3).
+#[allow(dead_code)]
 pub const EXTRACTABLE_EXTS: &[&str] = &["zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "7z", "rar", "zst", "lz"];
 
+#[allow(dead_code)] // used by the extract trigger (Task 3)
 pub fn is_extractable(path: &Path) -> bool {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let lower = name.to_ascii_lowercase();
@@ -547,25 +617,86 @@ fn run_external_extract(tool: &str, path: &Path, dest: &Path) -> std::io::Result
 // Misc helpers
 // ---------------------------------------------------------------------------
 
-/// `dir/name` -> `dir/name.1`, `dir/name.2`, ... picking a free target.
+/// Go `renameIfDuplicate`: `dir/name.ext` -> `dir/name(1).ext`,
+/// `dir/name(2).ext`, ... resuming the counter from an existing `(N)` suffix
+/// (cap 10_000). On exhaustion returns the original path; the subsequent fs
+/// call then fails, mirroring Go's error path.
 pub fn unique_target(p: PathBuf) -> PathBuf {
     if !p.exists() {
         return p;
     }
-    let stem = p.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
-    let ext = p.extension().map(|e| e.to_os_string());
-    for i in 1u32..10_000 {
-        let mut cand = PathBuf::from(&stem);
-        cand.push(format!(".{i}"));
-        if let Some(e) = &ext {
-            cand.set_extension(e);
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // Go: ext = filepath.Ext(base) — the suffix from the final dot, if any.
+    let ext = match name.rfind('.') {
+        Some(i) => name[i..].to_string(),
+        None => String::new(),
+    };
+    let stem = &name[..name.len() - ext.len()];
+    // Go suffixRegexp `^(.*)\((\d+)\)$` on the stem: resume from an existing (N).
+    let mut base = stem.to_string();
+    let mut counter = 1u32;
+    if let Some(inner) = stem.strip_suffix(')') {
+        if let Some(pos) = inner.rfind('(') {
+            let digits = &inner[pos + 1..];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                base = inner[..pos].to_string();
+                if let Ok(n) = digits.parse::<u32>() {
+                    counter = n + 1;
+                }
+            }
         }
-        cand = p.with_file_name(cand);
+    }
+    for i in counter..10_000 {
+        let cand = p.with_file_name(format!("{base}({i}){ext}"));
         if !cand.exists() {
             return cand;
         }
     }
     p
+}
+
+/// Go `countFiles`: recursive count of non-directory entries (symlinks count
+/// as one entry; directories themselves are not counted). Unreadable entries
+/// are skipped rather than aborting the count.
+pub fn count_files(path: &Path) -> usize {
+    match std::fs::symlink_metadata(path) {
+        Err(_) => 0,
+        Ok(m) if !m.is_dir() => 1,
+        Ok(_) => count_files_recursive(path),
+    }
+}
+
+fn count_files_recursive(dir: &Path) -> usize {
+    let mut count = 0;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    for e in rd.flatten() {
+        match std::fs::symlink_metadata(e.path()) {
+            Ok(m) if m.is_dir() => count += count_files_recursive(&e.path()),
+            Ok(_) => count += 1,
+            Err(_) => {}
+        }
+    }
+    count
+}
+
+/// Whether `src` and `dst` live on the same filesystem partition (Go
+/// `isSamePartition`; Unix approximation via `st_dev` of the canonicalized
+/// paths). Unknown metadata -> false (the conservative copy+remove path).
+pub fn is_same_partition(src: &Path, dst: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match (std::fs::metadata(canon(src)), std::fs::metadata(canon(dst))) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+fn base_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.display().to_string())
 }
 
 /// Check that `child` is not an ancestor of `parent` (paste validation).
@@ -577,6 +708,31 @@ pub fn is_ancestor(child: &Path, parent: &Path) -> bool {
         return false;
     };
     c == p || p.starts_with(&c)
+}
+
+/// Go `validatePasteOperation`: reject pasting a cut item back into its own
+/// parent directory, a directory into itself, or an item into itself or one
+/// of its subdirectories. Error strings match Go verbatim.
+pub fn validate_paste_operation(dest: &Path, items: &[PathBuf], cut: bool) -> Result<(), String> {
+    for src in items {
+        if cut && src.parent() == Some(dest) {
+            return Err(format!(
+                "cannot paste into parent directory of source, srcPath : {}, panelLocation : {}",
+                src.display(),
+                dest.display()
+            ));
+        }
+        if cut && src == dest {
+            return Err("cannot paste a directory into itself".to_string());
+        }
+        if is_ancestor(src, dest) {
+            return Err(format!(
+                "cannot {} and paste a directory into itself or its subdirectory",
+                if cut { "cut" } else { "copy" }
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Wait with a timeout for a child process, killing it if needed.
@@ -592,5 +748,245 @@ pub fn wait_timeout(mut child: std::process::Child, timeout: Duration) -> std::i
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Fresh unique temp directory per call.
+    fn temp_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("spf_fileops_{}_{}_{}", std::process::id(), tag, n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, "x").unwrap();
+        p
+    }
+
+    // ---- unique_target (Go renameIfDuplicate) --------------------------
+
+    #[test]
+    fn unique_target_no_collision_unchanged() {
+        let dir = temp_dir("uniq_free");
+        let p = dir.join("new.txt");
+        assert_eq!(unique_target(p.clone()), p);
+    }
+
+    #[test]
+    fn unique_target_go_name_n_ext_format() {
+        let dir = temp_dir("uniq_fmt");
+        touch(&dir, "a.txt");
+        assert_eq!(unique_target(dir.join("a.txt")), dir.join("a(1).txt"));
+        touch(&dir, "README");
+        assert_eq!(unique_target(dir.join("README")), dir.join("README(1)"));
+        // Non-numeric parens are part of the base name (Go regex mismatch).
+        touch(&dir, "c(a)");
+        assert_eq!(unique_target(dir.join("c(a)")), dir.join("c(a)(1)"));
+    }
+
+    #[test]
+    fn unique_target_resumes_existing_counter() {
+        let dir = temp_dir("uniq_resume");
+        touch(&dir, "a.txt");
+        touch(&dir, "a(1).txt");
+        touch(&dir, "a(2).txt");
+        assert_eq!(unique_target(dir.join("a.txt")), dir.join("a(3).txt"));
+        // Input already carries the (N) suffix: resume from it.
+        assert_eq!(unique_target(dir.join("a(2).txt")), dir.join("a(3).txt"));
+        touch(&dir, "b(3).png");
+        assert_eq!(unique_target(dir.join("b(3).png")), dir.join("b(4).png"));
+    }
+
+    // ---- count_files (Go countFiles) ------------------------------------
+
+    #[test]
+    fn count_files_counts_files_not_dirs() {
+        let dir = temp_dir("count");
+        touch(&dir, "a.txt");
+        touch(&dir, "sub/b.txt");
+        touch(&dir, "sub/deep/c.txt");
+        std::fs::create_dir_all(dir.join("emptydir")).unwrap();
+        assert_eq!(count_files(&dir), 3);
+        assert_eq!(count_files(&dir.join("a.txt")), 1);
+        assert_eq!(count_files(&dir.join("sub")), 2);
+        assert_eq!(count_files(&dir.join("emptydir")), 0);
+    }
+
+    #[test]
+    fn count_files_symlink_counts_once() {
+        let dir = temp_dir("count_link");
+        touch(&dir, "real/target.txt");
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        assert_eq!(count_files(&dir.join("link")), 1);
+    }
+
+    // ---- validate_paste_operation (Go validatePasteOperation) -----------
+
+    #[test]
+    fn validate_paste_cut_into_parent_rejected() {
+        let dir = temp_dir("paste_parent");
+        let src = touch(&dir, "a.txt");
+        let err = paste_err(&dir, &[src.clone()], true);
+        assert_eq!(
+            err,
+            Some(format!(
+                "cannot paste into parent directory of source, srcPath : {}, panelLocation : {}",
+                src.display(),
+                dir.display()
+            ))
+        );
+        // Copy into the same directory is allowed.
+        assert_eq!(paste_err(&dir, &[src], false), None);
+    }
+
+    #[test]
+    fn validate_paste_cut_directory_into_itself_rejected() {
+        let dir = temp_dir("paste_self");
+        let err = paste_err(&dir, &[dir.clone()], true);
+        assert_eq!(err, Some("cannot paste a directory into itself".to_string()));
+    }
+
+    #[test]
+    fn validate_paste_into_subdirectory_rejected() {
+        let dir = temp_dir("paste_sub");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(
+            paste_err(&dir.join("sub"), &[dir.clone()], false),
+            Some("cannot copy and paste a directory into itself or its subdirectory".to_string())
+        );
+        assert_eq!(
+            paste_err(&dir.join("sub"), &[dir.clone()], true),
+            Some("cannot cut and paste a directory into itself or its subdirectory".to_string())
+        );
+        // Copy of a directory into itself also trips the ancestor check.
+        assert_eq!(
+            paste_err(&dir, &[dir.clone()], false),
+            Some("cannot copy and paste a directory into itself or its subdirectory".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_paste_happy_path() {
+        let dir = temp_dir("paste_ok");
+        let src_dir = temp_dir("paste_ok_src");
+        let src = touch(&src_dir, "a.txt");
+        let src_dir2 = touch(&src_dir, "tree/b.txt").parent().unwrap().to_path_buf();
+        assert_eq!(paste_err(&dir, &[src, src_dir2], false), None);
+        // Cut from an unrelated directory into this one is fine.
+        let other = touch(&src_dir, "other.txt");
+        assert_eq!(paste_err(&dir, &[other], true), None);
+    }
+
+    fn paste_err(dest: &Path, items: &[PathBuf], cut: bool) -> Option<String> {
+        validate_paste_operation(dest, items, cut).err()
+    }
+
+    // ---- worker integration (temp dir) -----------------------------------
+
+    fn collect_worker_msgs(rx: mpsc::Receiver<WorkerMsg>) -> Vec<WorkerMsg> {
+        let mut msgs = Vec::new();
+        for msg in rx.iter() {
+            let done = matches!(msg, WorkerMsg::Done { .. });
+            msgs.push(msg);
+            if done {
+                break;
+            }
+        }
+        msgs
+    }
+
+    #[test]
+    fn worker_copy_dir_tree_reports_per_file_progress() {
+        let src_root = temp_dir("worker_copy_src");
+        touch(&src_root, "tree/a.txt");
+        touch(&src_root, "tree/sub/b.txt");
+        touch(&src_root, "tree/sub/c.txt");
+        let dest = temp_dir("worker_copy_dest");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Copy,
+            1,
+            vec![src_root.join("tree")],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let msgs = collect_worker_msgs(rx);
+
+        let progresses: Vec<(String, usize, usize)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { file, done, total, .. } => Some((file.clone(), *done, *total)),
+                _ => None,
+            })
+            .collect();
+        // R2: total is the recursive file count; per-file progress, absolute done.
+        assert!(progresses.iter().all(|(_, _, total)| *total == 3));
+        let dones: Vec<usize> = progresses.iter().map(|(_, d, _)| *d).collect();
+        assert_eq!(&dones[..3], &[1, 2, 3][..]); // one Progress per copied file
+        assert_eq!(*dones.last().unwrap(), 3); // final progress done = total
+        // Progress carries the base name, not the full path.
+        assert!(progresses.iter().all(|(f, _, _)| !f.contains('/') && !f.is_empty()));
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 1 })));
+
+        // Source tree intact, destination tree complete.
+        assert!(src_root.join("tree/sub/c.txt").exists());
+        assert!(dest.join("tree/a.txt").exists());
+        assert!(dest.join("tree/sub/b.txt").exists());
+        assert!(dest.join("tree/sub/c.txt").exists());
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn worker_same_device_cut_is_fast_rename() {
+        let root = temp_dir("worker_cut");
+        touch(&root, "src/a.txt");
+        touch(&root, "src/b.txt");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Cut,
+            2,
+            vec![root.join("src")],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let msgs = collect_worker_msgs(rx);
+
+        // R2: same-device cut renames the whole tree — no per-file progress,
+        // only the final done = total update.
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, .. } => Some(*done),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.last(), Some(&2));
+        assert!(!dones[..dones.len() - 1].iter().any(|d| *d > 0 && *d < 2));
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 2 })));
+
+        assert!(!root.join("src").exists());
+        assert!(dest.join("src/a.txt").exists());
+        assert!(dest.join("src/b.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
