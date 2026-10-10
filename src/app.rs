@@ -31,8 +31,11 @@
 //!     only tokenizes + parses it. AsyncMsg::SubstDone (never sent today) is
 //!     still handled defensively in handle_async.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
@@ -53,13 +56,14 @@ use crate::dialogs::{
     MODAL_W, SORT_H, SORT_W, THEME_W,
 };
 use crate::event::AsyncMsg;
+use crate::fileops::{self, OpKind, WorkerMsg};
 use crate::icons::{self, Ui};
 use crate::keys::{self, Key};
 use crate::metadata;
 use crate::panel::SortKind;
 use crate::panels::PanelGroup;
 use crate::preview;
-use crate::processbar::ProcessBar;
+use crate::processbar::{Operation, ProcessBar, State};
 use crate::prompt::{self, Prompt, PromptAction, SpfCmd};
 use crate::render::{RBuf, St};
 use crate::sidebar::Sidebar;
@@ -130,8 +134,22 @@ pub struct App {
     md_rx: mpsc::Receiver<metadata::MetadataMsg>,
     md_tx: mpsc::Sender<metadata::MetadataMsg>,
     io_req: u64, // monotonically increasing id counter (Go ioReqCnt)
+    ops: HashMap<u64, OpRecord>, // live background file operations (Go processbar processes)
     preview_spawn_dims: (usize, usize), // last (content w, content h) a preview was spawned with
     preview_closed_by_user: bool,
+}
+
+/// One live background file operation: what it is, where it writes, its
+/// cancel flag (shared with the worker), and its total item/file count.
+/// `dest`/`cancel`/`total` drive the skip/abort resume flow (Task 3).
+struct OpRecord {
+    kind: OpKind,
+    #[allow(dead_code)]
+    dest: PathBuf,
+    #[allow(dead_code)]
+    cancel: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    total: usize,
 }
 
 impl App {
@@ -210,6 +228,7 @@ impl App {
             md_rx,
             md_tx,
             io_req: 0,
+            ops: HashMap::new(),
             preview_spawn_dims: (0, 0),
             preview_closed_by_user: false,
         }
@@ -813,7 +832,7 @@ impl App {
             return;
         }
         if keys::matches_any(&self.hotkeys.paste_items, k) {
-            // TODO(task-B)
+            self.paste_items();
             return;
         }
         if keys::matches_any(&self.hotkeys.file_panel_item_create, k) {
@@ -928,10 +947,10 @@ impl App {
                 // TODO(task-B)
             }
             if keys::matches_any(&self.hotkeys.copy_items, k) {
-                // TODO(task-B)
+                self.copy_multiple_items(false);
             }
             if keys::matches_any(&self.hotkeys.cut_items, k) {
-                // TODO(task-B)
+                self.copy_multiple_items(true);
             }
             if keys::matches_any(&self.hotkeys.copy_path, k) {
                 self.copy_path();
@@ -959,11 +978,11 @@ impl App {
             return;
         }
         if keys::matches_any(&self.hotkeys.copy_items, k) {
-            // TODO(task-B)
+            self.copy_single_item(false);
             return;
         }
         if keys::matches_any(&self.hotkeys.cut_items, k) {
-            // TODO(task-B)
+            self.copy_single_item(true);
             return;
         }
         if keys::matches_any(&self.hotkeys.file_panel_item_rename, k) {
@@ -1307,6 +1326,108 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // File operations (Task B)
+    // ------------------------------------------------------------------
+
+    /// Go copySingleItem — copy/cut the focused item into the clipboard
+    /// (normal/browser mode).
+    fn copy_single_item(&mut self, cut: bool) {
+        self.clipboard_ui.reset(cut);
+        let panel = self.group.focused_panel();
+        if panel.empty() {
+            return;
+        }
+        if let Some(e) = panel.cursor_entry() {
+            self.clipboard_ui.add(&e.path.display().to_string());
+        }
+    }
+
+    /// Go copyMultipleItem — copy/cut all selected items, in visible order
+    /// (select mode).
+    fn copy_multiple_items(&mut self, cut: bool) {
+        self.clipboard_ui.reset(cut);
+        let panel = self.group.focused_panel();
+        if panel.selected_count() == 0 {
+            return;
+        }
+        let items: Vec<String> = panel
+            .selected_paths()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        self.clipboard_ui.set_items(&items);
+    }
+
+    /// Go getPasteItemCmd + validatePasteOperation.
+    fn paste_items(&mut self) {
+        let items: Vec<PathBuf> = self
+            .clipboard_ui
+            .prune_inaccessible_and_get()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let cut = self.clipboard_ui.is_cut();
+        let dest = self.group.focused_panel().location.clone();
+        if let Err(err) = fileops::validate_paste_operation(&dest, &items, cut) {
+            self.notify.open("Invalid paste location".to_string(), err, ConfirmAction::NoAction);
+            return;
+        }
+        self.spawn_op(if cut { OpKind::Cut } else { OpKind::Copy }, items, dest);
+    }
+
+    /// Go executePasteOperation et al. — register the process-bar entry,
+    /// spawn the worker, and bridge its `WorkerMsg`s to the UI as `AsyncMsg`s
+    /// (`Progress -> OpProgress`, `Fail -> OpFail`, `Done -> OpDone`).
+    fn spawn_op(&mut self, kind: OpKind, items: Vec<PathBuf>, dest: PathBuf) {
+        if items.is_empty() {
+            return;
+        }
+        self.io_req += 1;
+        let op_id = self.io_req;
+        let cancel = Arc::new(AtomicBool::new(false));
+        // R2: paste totals are recursive file counts; other ops count items.
+        let total: usize = match kind {
+            OpKind::Copy | OpKind::Cut => items.iter().map(|p| fileops::count_files(p)).sum(),
+            _ => items.len(),
+        };
+        let name = items[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| items[0].display().to_string());
+
+        let (wtx, wrx) = mpsc::channel::<WorkerMsg>();
+        fileops::spawn_worker(kind, op_id, items, dest.clone(), cancel.clone(), wtx);
+        let utx = self.tx.clone();
+        let cancel_flag = cancel.clone();
+        std::thread::spawn(move || {
+            for msg in wrx.iter() {
+                let ui = match msg {
+                    WorkerMsg::Progress { op, file, done, total } => {
+                        AsyncMsg::OpProgress { op, file, done, total }
+                    }
+                    WorkerMsg::Fail { op, file, err, remaining } => {
+                        AsyncMsg::OpFail { op, file, err, remaining }
+                    }
+                    WorkerMsg::Done { op } => {
+                        AsyncMsg::OpDone { op, cancelled: cancel_flag.load(Ordering::Relaxed) }
+                    }
+                };
+                if utx.send(ui).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let _ = self
+            .processbar
+            .add(op_id, processbar_operation(kind), &name, total as u64);
+        self.ops.insert(op_id, OpRecord { kind, dest, cancel, total });
+    }
+
     fn handle_async(&mut self, msg: AsyncMsg) {
         match msg {
             AsyncMsg::DirListed { path, entries, .. } => {
@@ -1320,11 +1441,23 @@ impl App {
                 self.processbar
                     .update_progress(op, &file, done as u64, total as u64);
             }
-            AsyncMsg::OpFail { .. } => {
-                // TODO(task-B): spf_error.open(err, remaining)
+            AsyncMsg::OpFail { op, file, err, remaining } => {
+                // R4: keep the process-bar entry in-operation and keep the
+                // OpRecord until the user skips or aborts. Skip/abort wiring
+                // lands in Task 3; until then the modal's keys just close it.
+                let _ = (op, file);
+                self.spf_error.open(err, remaining);
             }
-            AsyncMsg::OpDone { .. } => {
-                // TODO(task-B): finish op in the process bar
+            AsyncMsg::OpDone { op, cancelled } => {
+                let state = if cancelled { State::Cancelled } else { State::Successful };
+                self.processbar.finish(op, state, None);
+                if let Some(rec) = self.ops.remove(&op) {
+                    apply_paste_effects(&mut self.clipboard_ui, rec.kind, state);
+                }
+                // R9: refresh every panel so pasted/moved entries show up.
+                for p in self.group.panels_mut() {
+                    p.dirty = true;
+                }
             }
             AsyncMsg::Metadata { .. } => {}
             AsyncMsg::Md5 { .. } => {}
@@ -1541,6 +1674,27 @@ impl App {
 // Free functions
 // ----------------------------------------------------------------------
 
+/// Map an op kind to its process-bar operation type.
+fn processbar_operation(kind: OpKind) -> Operation {
+    match kind {
+        OpKind::Copy => Operation::Copy,
+        OpKind::Cut => Operation::Cut,
+        OpKind::Delete => Operation::Delete,
+        OpKind::Create => Operation::Create,
+        OpKind::Compress => Operation::Compress,
+        OpKind::Extract => Operation::Extract,
+    }
+}
+
+/// Go `PasteOperationMsg.ApplyToModel` — a completed (successful or failed,
+/// but not cancelled) cut paste clears the clipboard. A cut paste is exactly
+/// a `Cut` op with a cut clipboard; other op kinds leave it untouched.
+fn apply_paste_effects(clipboard: &mut Clipboard, kind: OpKind, state: State) {
+    if kind == OpKind::Cut && state != State::Cancelled && clipboard.is_cut() {
+        clipboard.reset(false);
+    }
+}
+
 /// Go setHeightValues footer logic.
 fn footer_height(full_h: usize, toggle: bool) -> usize {
     if !toggle {
@@ -1742,5 +1896,36 @@ mod tests {
             resolve_abs(Path::new("/a"), Path::new("b/c")),
             PathBuf::from("/a/b/c")
         );
+    }
+
+    #[test]
+    fn test_apply_paste_effects() {
+        // Go PasteOperationMsg.ApplyToModel: a completed cut paste clears
+        // the clipboard; cancelled ones and copy pastes do not.
+        let mut clipboard = Clipboard::new();
+
+        clipboard.reset(true);
+        clipboard.add("/tmp/x");
+        apply_paste_effects(&mut clipboard, OpKind::Cut, State::Successful);
+        assert!(!clipboard.is_cut());
+        assert!(clipboard.items().is_empty());
+
+        clipboard.reset(true);
+        clipboard.add("/tmp/x");
+        apply_paste_effects(&mut clipboard, OpKind::Cut, State::Cancelled);
+        assert!(clipboard.is_cut());
+        assert_eq!(clipboard.items(), vec!["/tmp/x".to_string()]);
+
+        clipboard.reset(true);
+        clipboard.add("/tmp/x");
+        apply_paste_effects(&mut clipboard, OpKind::Copy, State::Successful);
+        assert!(clipboard.is_cut());
+        assert_eq!(clipboard.items(), vec!["/tmp/x".to_string()]);
+
+        // Delete ops leave the clipboard alone.
+        clipboard.reset(true);
+        clipboard.add("/tmp/x");
+        apply_paste_effects(&mut clipboard, OpKind::Delete, State::Successful);
+        assert!(clipboard.is_cut());
     }
 }
