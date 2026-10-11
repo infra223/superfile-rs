@@ -66,12 +66,17 @@ Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
 ## Verification gate (per delivery)
 - `~/.cargo/bin/cargo check 2>&1 | grep src/<file>.rs` → empty (app/fileops/processbar clean)
 - `~/.cargo/bin/cargo check --tests 2>&1 | grep src/<file>.rs` → empty
-- `~/.cargo/bin/cargo test` → 170/170 green
-- Remaining 30 warnings = pre-existing dead-code for other features (Metadata/Md5/SubstDone/
-  UpdateCheck variants, req_id fields, unused util/sidebar helpers). All Task-B APIs are consumed;
+- `~/.cargo/bin/cargo test` → 174/174 green (170 at delivery + 4 final-review fix tests)
+- Remaining 29 warnings (`cargo check`) / 22 (`cargo check --tests`) = pre-existing dead-code
+  for other features (Metadata/Md5/SubstDone/UpdateCheck variants, req_id fields, unused
+  util/sidebar helpers). All Task-B APIs are consumed;
   `TODO(task-B)` markers: 0.
 
 ## Notes
 - Toolchain: `~/.cargo/bin/cargo`. Env quirks: std fork (no remove_all, no DirEntry::symlink_metadata), ratatui fork (local BorderSet, Cell API).
 - serde_derive 1.0.229: container `#[serde(default)]` ⇒ `let __default = Default::default()` in visit_map (unconditional emission; only skipped by LLVM when provably unused). Never pair with a self-deserializing Default impl.
 - Worker progress stream (Go-faithful): Copy/Cut cross-device emit per-file callback Progress + per-item update Progress + final done update (single-file copy = two same-`done` updates); Delete/Create/Extract one update per item.
+- Plan flaw found in final review (flag for a future R5 revision): R5's skip `done_offset` is
+  item-count-based, while Copy/Cut progress totals are file-count-based, so a resumed Copy/Cut
+  after an spf-error skip can show misplaced progress (display-only — the file operations
+  themselves are correct).
