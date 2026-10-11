@@ -9,11 +9,11 @@ Rust port of Go `superfile` v1.6.0 → binary `spf`. Orchestrator + 1 subagent (
 | clipboard.rs | ✅ done + verified |
 | sidebar.rs | ✅ done + verified |
 | processbar.rs | ✅ done + verified (555 lines, 6 tests) |
-| metadata.rs | ✅ done + verified (1020 lines, 7 tests) |
+| metadata.rs | ✅ done + verified (1161 lines, 9 tests) |
 | dialogs.rs | ✅ done + verified (2076 lines, 18 tests; notify/spferror/sort/theme/help/typing + first-use) |
 | panels.rs | ✅ done + verified (1097 lines, 17 tests; PanelGroup + full panel render) |
 | fileops.rs | ✅ TASK B done + verified (1688 lines, 28 tests; paste/compress/extract/delete/create workers, Go naming + totals) |
-| app.rs | ✅ TASK A + TASK B done + verified (2408 lines, 11 tests; core state/event loop/layout/render/dispatch/preview/metadata/zoxide/prompt/quit/updates + all file-op triggers + spf-error skip/abort) |
+| app.rs | ✅ TASK A + TASK B done + verified (2481 lines, 12 tests; core state/event loop/layout/render/dispatch/preview/metadata/zoxide/prompt/quit/updates + all file-op triggers + spf-error skip/abort) |
 | **TESTS** | ✅ **170/170 passing** |
 
 ## TASK B complete (file ops)
@@ -66,7 +66,7 @@ Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
 ## Verification gate (per delivery)
 - `~/.cargo/bin/cargo check 2>&1 | grep src/<file>.rs` → empty (app/fileops/processbar clean)
 - `~/.cargo/bin/cargo check --tests 2>&1 | grep src/<file>.rs` → empty
-- `~/.cargo/bin/cargo test` → 174/174 green (170 at delivery + 4 final-review fix tests)
+- `~/.cargo/bin/cargo test` → 177/177 green (174 at TASK B delivery + 3 post-merge fix tests)
 - Remaining 29 warnings (`cargo check`) / 22 (`cargo check --tests`) = pre-existing dead-code
   for other features (Metadata/Md5/SubstDone/UpdateCheck variants, req_id fields, unused
   util/sidebar helpers). All Task-B APIs are consumed;
@@ -80,3 +80,15 @@ Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
   item-count-based, while Copy/Cut progress totals are file-count-based, so a resumed Copy/Cut
   after an spf-error skip can show misplaced progress (display-only — the file operations
   themselves are correct).
+
+## Post-merge runtime fixes (pty smoke vs Go binary)
+1. app.rs: preview pane never got width — `relayout()` now runs when the preview opens
+   lazily (Go recomputes child widths on open-state flip). 530803d.
+2. app.rs: metadata pane blank with default config — `update_metadata()` no longer gates
+   on `config.metadata` (Go gates only the exiftool fields inside the worker; the
+   `disableMetadata` dispatch gate is test-only). 043b64a.
+3. metadata.rs: ported the missing `Attributes` row (Go metadata_linux.go: FS_IOC_GETFLAGS
+   ioctl + 22-slot decodeChattr; row omitted when the fs rejects the ioctl). libc added as
+   direct dep. Note: installed /usr/bin/spf v1.6.0 predates repo HEAD b2af9a6, so its
+   directory `Size` shows the inode stat while Rust correctly shows Go HEAD's `(focus)`
+   behavior (real dir size when the metadata pane is focused).

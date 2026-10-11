@@ -1539,6 +1539,7 @@ dependencies = [
  "flate2",
  "humansize",
  "image",
+ "libc",
  "md-5",
  "ratatui",
  "serde",

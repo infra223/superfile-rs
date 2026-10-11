@@ -442,6 +442,12 @@ fn collect_metadata(path: &str, focused: bool, config: &Config) -> MetadataData 
                     }
                 }
 
+                // Attributes (Go getFileAttributes: chattr flags; the row is
+                // omitted when the filesystem does not support the ioctl).
+                if let Some(attrs) = file_attributes(p) {
+                    data.rows.push(("Attributes".to_string(), attrs));
+                }
+
                 // Exiftool (only if enabled)
                 if config.metadata {
                     apply_exiftool(path, &mut data);
@@ -588,6 +594,92 @@ fn value_str(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "<nil>".to_string(),
         serde_json::Value::Object(_) => v.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Linux file attributes (Go metadata_linux.go)
+// ---------------------------------------------------------------------------
+
+// ext4/ext2 inode flags — values from linux/fs.h and ext2_fs.h (stable ABI).
+const FS_SECRM_FL: u32 = 0x00000001;
+const FS_UNRM_FL: u32 = 0x00000002;
+const FS_COMPR_FL: u32 = 0x00000004;
+const FS_SYNC_FL: u32 = 0x00000008;
+const FS_IMMUTABLE_FL: u32 = 0x00000010;
+const FS_APPEND_FL: u32 = 0x00000020;
+const FS_NODUMP_FL: u32 = 0x00000040;
+const FS_NOATIME_FL: u32 = 0x00000080;
+const FS_NOCOMP_FL: u32 = 0x00000400;
+const FS_ENCRYPT_FL: u32 = 0x00000800;
+const FS_INDEX_FL: u32 = 0x00001000;
+const FS_JOURNAL_DATA_FL: u32 = 0x00004000;
+const FS_NOTAIL_FL: u32 = 0x00008000;
+const FS_DIRSYNC_FL: u32 = 0x00010000;
+const FS_TOPDIR_FL: u32 = 0x00020000;
+const FS_EXTENT_FL: u32 = 0x00080000;
+const FS_VERITY_FL: u32 = 0x00100000;
+const FS_NOCOW_FL: u32 = 0x00800000;
+const FS_DAX_FL: u32 = 0x02000000;
+const FS_INLINE_DATA_FL: u32 = 0x10000000;
+const FS_PROJINHERIT_FL: u32 = 0x20000000;
+const FS_CASEFOLD_FL: u32 = 0x40000000;
+
+/// Port of Go decodeChattr: 22 fixed-order slots, letter when the flag is
+/// set, '-' otherwise. Order per e2fsprogs lib/e2p/pf.c (lsattr).
+fn decode_chattr(flags: u32) -> String {
+    const ORDER: [(u32, char); 22] = [
+        (FS_SECRM_FL, 's'),         // Secure_Deletion
+        (FS_UNRM_FL, 'u'),          // Undelete
+        (FS_SYNC_FL, 'S'),          // Synchronous_Updates
+        (FS_DIRSYNC_FL, 'D'),       // Synchronous_Directory_Updates
+        (FS_IMMUTABLE_FL, 'i'),     // Immutable
+        (FS_APPEND_FL, 'a'),        // Append_Only
+        (FS_NODUMP_FL, 'd'),        // No_Dump
+        (FS_NOATIME_FL, 'A'),       // No_Atime
+        (FS_COMPR_FL, 'c'),         // Compression_Requested
+        (FS_ENCRYPT_FL, 'E'),       // Encrypted
+        (FS_JOURNAL_DATA_FL, 'j'),  // Journaled_Data
+        (FS_INDEX_FL, 'I'),         // Indexed_directory
+        (FS_NOTAIL_FL, 't'),        // No_Tailmerging
+        (FS_TOPDIR_FL, 'T'),        // Top_of_Directory_Hierarchies
+        (FS_EXTENT_FL, 'e'),        // Extents
+        (FS_NOCOW_FL, 'C'),         // No_COW
+        (FS_DAX_FL, 'x'),           // DAX
+        (FS_CASEFOLD_FL, 'F'),      // Casefold
+        (FS_INLINE_DATA_FL, 'N'),   // Inline_Data
+        (FS_PROJINHERIT_FL, 'P'),   // Project_Hierarchy
+        (FS_VERITY_FL, 'V'),        // Verity
+        (FS_NOCOMP_FL, 'm'),        // Dont_Compress
+    ];
+    let mut attrs: Vec<char> = vec!['-'; ORDER.len()];
+    for (i, (flag, letter)) in ORDER.iter().enumerate() {
+        if flags & flag != 0 {
+            attrs[i] = *letter;
+        }
+    }
+    attrs.into_iter().collect()
+}
+
+/// Port of Go getFileAttributes (metadata_linux.go): FS_IOC_GETFLAGS ioctl
+/// on the file/dir fd. None when the filesystem does not support it
+/// (Go: returns "", false -> row omitted).
+#[cfg(target_os = "linux")]
+fn file_attributes(path: &Path) -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).ok()?;
+    let mut flags: u32 = 0;
+    let ret = unsafe { libc::ioctl(f.as_raw_fd(), libc::FS_IOC_GETFLAGS as libc::c_ulong, &mut flags) };
+    if ret < 0 {
+        return None;
+    }
+    Some(decode_chattr(flags))
+}
+
+/// Go metadata_other.go: attributes unsupported -> row omitted.
+/// (Go has separate freebsd/windows implementations; this port is Linux-only.)
+#[cfg(not(target_os = "linux"))]
+fn file_attributes(_path: &Path) -> Option<String> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +902,55 @@ mod tests {
 
     fn temp_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("spfmd_test_{}", std::process::id()))
+    }
+
+    #[test]
+    fn test_decode_chattr_matches_go_positions() {
+        // Go decodeChattr (metadata_linux.go): 22 fixed-order slots, '-' when
+        // unset. Order: s u S D i a d A c E j I t T e C x F N P V m.
+        assert_eq!(decode_chattr(0), "----------------------");
+        assert_eq!(decode_chattr(FS_IMMUTABLE_FL), "----i-----------------");
+        assert_eq!(
+            decode_chattr(FS_APPEND_FL | FS_NOATIME_FL | FS_CASEFOLD_FL),
+            "-----a-A---------F----"
+        );
+    }
+
+    #[test]
+    fn test_collect_metadata_includes_attributes_row() {
+        // Go appends the Attributes row (chattr flags via FS_IOC_GETFLAGS)
+        // for dirs and regular files; unmapped sort key -> after all
+        // priority rows (observed: after Group).
+        let dir = temp_dir().join("attrs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("attr.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let config = Config::default();
+        let data = collect_metadata(&file.display().to_string(), false, &config);
+        let idx = data
+            .rows
+            .iter()
+            .position(|(k, _)| k == "Attributes")
+            .expect("Attributes row missing");
+        let value = &data.rows[idx].1;
+        assert_eq!(value.chars().count(), 22);
+        assert!(value
+            .chars()
+            .all(|c| c == '-' || c.is_ascii_alphabetic()));
+        let group_idx = data
+            .rows
+            .iter()
+            .position(|(k, _)| k == "Group")
+            .expect("Group row missing");
+        assert!(idx > group_idx, "Attributes must sort after Group");
+
+        // Directories get the row too (Go: getFileAttributes on dir fd).
+        let data = collect_metadata(&dir.display().to_string(), false, &config);
+        assert!(data.rows.iter().any(|(k, _)| k == "Attributes"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
