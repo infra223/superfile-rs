@@ -409,12 +409,15 @@ pub fn create_item(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Delete: to the OS trash when available (Linux XDG), else permanent.
+/// Delete: to the OS trash when `use_trash` (Linux XDG), else permanent.
+///
+/// Go `makeDeleteProcessor`: when the user confirmed a *trash* delete, a
+/// failing `trash_move` fails the process (error modal) — it must NOT fall
+/// through to permanent removal, which would destroy data the user expected
+/// to be recoverable.
 pub fn delete_item(path: &Path, use_trash: bool) -> std::io::Result<()> {
     if use_trash {
-        if let Ok(res) = trash_move(path) {
-            return Ok(res);
-        }
+        return trash_move(path);
     }
     if path.is_dir() && !path.is_symlink() {
         std::fs::remove_dir_all(path)
@@ -1339,6 +1342,35 @@ mod tests {
         // Existing contents untouched.
         assert_eq!(std::fs::read_to_string(&at_cap).unwrap(), "keep");
         assert_eq!(std::fs::read_to_string(&huge).unwrap(), "keep2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- delete_item (Go makeDeleteProcessor) ------------------------------
+
+    #[test]
+    fn delete_item_trash_failure_does_not_permanently_delete() {
+        // Review fix 1 (critical): with use_trash = true a failing trash_move
+        // must fail the delete (Go error modal), NOT fall through to
+        // remove_dir_all/remove_file and destroy the data.
+        // Deterministic failure: Trash/files exists as a regular file, so
+        // create_dir_all(files) fails regardless of user/permissions.
+        let _guard = TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("delete_trash_fail");
+        let trash = dir.join("Trash");
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        std::fs::write(trash.join("files"), "blocker").unwrap();
+        let victim = touch(&dir, "victim.txt");
+
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let result = delete_item(&victim, true);
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        assert!(result.is_err(), "trash failure must propagate, not fall back");
+        assert!(victim.exists(), "source must survive a failed trash delete");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "x");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
