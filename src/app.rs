@@ -1840,9 +1840,11 @@ impl App {
 
     /// Go getMetadataCmd.
     fn update_metadata(&mut self) {
-        if !self.config.metadata {
-            return;
-        }
+        // Go getMetadataCmd has no config gate (its `disableMetadata` field is
+        // test-only). The `metadata` config flag only gates the exiftool
+        // fields inside the worker (Go updateExiftoolMetadata; Rust
+        // metadata.rs collect_metadata), so the pane must fetch basic
+        // metadata even when the flag is false.
         let panel = self.group.focused_panel();
         if panel.empty() {
             self.metadata.set_blank();
@@ -2166,6 +2168,58 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert_eq!(read_bool_file(&p, false), false);
         assert_eq!(read_bool_file(&p, true), true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_metadata_dispatches_with_plugin_flag_off() {
+        // Go: `metadata` in config.toml only gates the exiftool fields inside
+        // the worker (updateExiftoolMetadata); the pane dispatch itself is
+        // unconditional (getMetadataCmd). Rust must fetch basic metadata
+        // even when the flag is false.
+        let dir = std::env::temp_dir().join(format!("spf_md_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("item.txt"), "x").unwrap();
+        std::fs::write(dir.join("config/config.toml"), "metadata = false\n").unwrap();
+
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+            data_dir: dir.join("data"),
+            config_file: None,
+            hotkey_file: None,
+        };
+        let mut app = App::new(paths, vec![dir.clone()], false, None);
+        assert!(!app.config.metadata, "test requires the plugin flag off");
+
+        // Populate the focused panel through the real async listing path.
+        app.relist_panels();
+        for _ in 0..50 {
+            if let Ok(msg) = app.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                app.handle_async(msg);
+            }
+            if app.group.focused_panel().cursor_entry().is_some() {
+                break;
+            }
+        }
+        assert!(
+            app.group.focused_panel().cursor_entry().is_some(),
+            "DirListed did not arrive"
+        );
+
+        app.update_metadata();
+
+        // The fetch must be dispatched for the focused cursor item (worker
+        // sends a MetadataMsg) and the pane must have adopted its location.
+        let expected = app.group.focused_panel().cursor_entry().unwrap().path.clone();
+        let msg = app
+            .md_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("no MetadataMsg dispatched with metadata = false");
+        assert_eq!(PathBuf::from(&msg.data.filepath), expected);
+        assert_eq!(app.metadata.get_location(), expected.display().to_string());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
