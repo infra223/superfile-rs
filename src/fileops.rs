@@ -283,7 +283,6 @@ pub fn op_total(kind: OpKind, items: &[PathBuf]) -> usize {
 /// `total` is the original process total and `done_offset` the progress
 /// already reported (R5: `total - remaining.len()`); neither is recomputed
 /// from `remaining`.
-#[allow(dead_code)] // wired by the skip/abort flow (Task 3)
 pub fn spawn_remaining(
     kind: OpKind,
     op_id: u64,
@@ -1545,5 +1544,145 @@ mod tests {
         assert!(dest.join("tree/sub/b.txt").is_file());
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ---- skip/abort resume (Go FileListErrorState, R3-R5) ----------------
+
+    #[test]
+    fn worker_failure_reports_remaining_for_skip() {
+        let dir = temp_dir("skip_fail");
+        let missing = dir.join("missing.txt"); // fails first
+        let a = touch(&dir, "a.txt");
+        let b = touch(&dir, "b.txt");
+        let dest = temp_dir("skip_fail_dest");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Copy,
+            9,
+            vec![missing.clone(), a.clone(), b.clone()],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            2,
+            0,
+            false,
+        );
+        let msgs = collect_worker_msgs(rx);
+        match msgs.last() {
+            Some(WorkerMsg::Fail { op, file, err, remaining }) => {
+                assert_eq!(*op, 9);
+                assert_eq!(*file, missing.display().to_string());
+                assert!(!err.is_empty());
+                // Go notProcessed = items[i:] minus the failed item (the
+                // Skip key drops it before resuming).
+                assert_eq!(
+                    *remaining,
+                    vec![a.display().to_string(), b.display().to_string()]
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn skip_resume_flow_completes_process() {
+        // R3: item 1 fails -> Skip -> the rest complete -> Done (the app
+        // finishes the process Successful). R5: same op id, original total,
+        // done_offset = total - remaining.len().
+        let dir = temp_dir("skip_resume");
+        let missing = dir.join("missing.txt");
+        let a = touch(&dir, "a.txt");
+        let b = touch(&dir, "b.txt");
+        let dest = temp_dir("skip_resume_dest");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Copy,
+            10,
+            vec![missing.clone(), a.clone(), b.clone()],
+            dest.clone(),
+            cancel.clone(),
+            tx,
+            2,
+            0,
+            false,
+        );
+        let remaining = match collect_worker_msgs(rx).last() {
+            Some(WorkerMsg::Fail { remaining, .. }) => remaining.clone(),
+            other => panic!("expected Fail, got {other:?}"),
+        };
+
+        let (tx2, rx2) = mpsc::channel();
+        spawn_remaining(
+            OpKind::Copy,
+            10,
+            remaining,
+            dest.clone(),
+            cancel.clone(),
+            tx2,
+            2,
+            2 - 2, // R5: total - remaining.len()
+            false,
+        );
+        let msgs = collect_worker_msgs(rx2);
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, total, .. } => {
+                    assert_eq!(*total, 2); // original total, not recomputed
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones, vec![1, 1, 2, 2, 2]); // per-file cb + per-item update + final
+        // Done on the SAME op id -> the app marks the process Successful (R3).
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 10 })));
+        assert!(dest.join("a.txt").is_file());
+        assert!(dest.join("b.txt").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn spawn_remaining_uses_explicit_total_and_done_offset() {
+        // R5: totals/offsets come from the caller, never recomputed from
+        // `remaining` (a resumed copy must continue the absolute progress).
+        let dir = temp_dir("resume_offset");
+        let a = touch(&dir, "a.txt");
+        let b = touch(&dir, "b.txt");
+        let dest = temp_dir("resume_offset_dest");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_remaining(
+            OpKind::Copy,
+            11,
+            vec![a.display().to_string(), b.display().to_string()],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            5,
+            3,
+            false,
+        );
+        let msgs = collect_worker_msgs(rx);
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, total, .. } => {
+                    assert_eq!(*total, 5);
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones, vec![4, 4, 5, 5, 5]); // continues from done_offset = 3
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 11 })));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

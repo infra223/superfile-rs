@@ -209,6 +209,16 @@ impl ProcessBar {
             .any(|p| p.state == State::InOperation && p.done != p.total)
     }
 
+    /// State and error message of a registered process (test-only view of
+    /// the private process list).
+    #[cfg(test)]
+    pub fn process_status(&self, id: u64) -> Option<(State, String)> {
+        self.processes
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.state, p.error_msg.clone()))
+    }
+
     /// Move the cursor up, wrapping to the last process (Go ListUp).
     pub fn list_up(&mut self) {
         let cnt_p = self.processes.len();
@@ -242,14 +252,6 @@ impl ProcessBar {
             self.render_index = 0;
             self.cursor = 0;
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.processes.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.processes.len()
     }
 
     /// Number of processes that fit the current height (Go cntRenderableProcess:

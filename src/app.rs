@@ -6,7 +6,7 @@
 //! 1. Poll-based event loop (crossterm poll ~16ms) instead of bubbletea's channel loop;
 //!    tea.Cmd/tea.Msg become std::thread + mpsc.
 //! 2. File-operation keys (paste/copy/cut/delete/create-confirm/zip/extract) and the
-//!    spf-error skip/abort flow are TASK B — wired as no-ops with `// TODO(task-B)` for now.
+//!    spf-error skip/abort flow run as background workers with process-bar entries.
 //! 3. Prompt shell mode runs in a worker thread (AsyncMsg::ShellDone) instead of Go's
 //!    blocking-in-Update execution (identical observable behavior, no UI freeze).
 //! 4. `$(cmd)` substitutions and the zoxide CLI query run in worker threads.
@@ -141,6 +141,7 @@ pub struct App {
     md_tx: mpsc::Sender<metadata::MetadataMsg>,
     io_req: u64, // monotonically increasing id counter (Go ioReqCnt)
     ops: HashMap<u64, OpRecord>, // live background file operations (Go processbar processes)
+    error_op: Option<u64>, // op whose failure opened the spf-error modal
     preview_spawn_dims: (usize, usize), // last (content w, content h) a preview was spawned with
     preview_closed_by_user: bool,
 }
@@ -151,15 +152,10 @@ pub struct App {
 /// when the user aborts). These drive the skip/abort resume flow.
 struct OpRecord {
     kind: OpKind,
-    #[allow(dead_code)]
     dest: PathBuf,
-    #[allow(dead_code)]
     cancel: Arc<AtomicBool>,
-    #[allow(dead_code)]
     total: usize,
-    #[allow(dead_code)]
     use_trash: bool,
-    #[allow(dead_code)]
     err: String,
 }
 
@@ -240,6 +236,7 @@ impl App {
             md_tx,
             io_req: 0,
             ops: HashMap::new(),
+            error_op: None,
             preview_spawn_dims: (0, 0),
             preview_closed_by_user: false,
         }
@@ -580,14 +577,15 @@ impl App {
         if self.spf_error.is_open() {
             match self.spf_error.handle_key(k, &self.hotkeys) {
                 dialogs::SpfErrorAction::Skip => {
+                    // Go spfErrorModelOpenKey -> FileListErrorState.Skip.
                     let remaining = self.spf_error.close();
-                    // TODO(task-B): resume worker with remaining (drop first; empty -> abort)
-                    let _ = remaining;
+                    self.skip_op(remaining);
                 }
                 dialogs::SpfErrorAction::Abort => {
+                    // Go spfErrorModelOpenKey -> FileListErrorState.Abort.
                     let remaining = self.spf_error.close();
-                    // TODO(task-B): abort worker (empty remaining)
                     let _ = remaining;
+                    self.abort_op();
                 }
                 dialogs::SpfErrorAction::None => {}
             }
@@ -1572,6 +1570,51 @@ impl App {
         });
     }
 
+    /// Go `FileListErrorState.Skip`: resume the failed op with the remaining
+    /// items under the same process id (R4: the process-bar entry stays
+    /// in-operation). An empty list aborts instead (R5); progress continues
+    /// from `total - remaining.len()` (R5) with the original total.
+    fn skip_op(&mut self, remaining: Vec<String>) {
+        if remaining.is_empty() {
+            self.abort_op();
+            return;
+        }
+        let op_id = match self.error_op.take() {
+            Some(id) => id,
+            None => return,
+        };
+        let (kind, dest, cancel, total, use_trash) = match self.ops.get(&op_id) {
+            Some(rec) => (
+                rec.kind,
+                rec.dest.clone(),
+                rec.cancel.clone(),
+                rec.total,
+                rec.use_trash,
+            ),
+            None => return,
+        };
+        let done_offset = total.saturating_sub(remaining.len());
+        let (wtx, wrx) = mpsc::channel::<WorkerMsg>();
+        fileops::spawn_remaining(
+            kind,
+            op_id,
+            remaining,
+            dest,
+            cancel.clone(),
+            wtx,
+            total,
+            done_offset,
+            use_trash,
+        );
+        self.bridge_worker(wrx, cancel);
+    }
+
+    /// Go `FileListErrorState.Abort`: cancel the worker, finish the process
+    /// Failed with the error stored by `OpFail`, and drop the record.
+    fn abort_op(&mut self) {
+        apply_abort(&mut self.processbar, &mut self.ops, &mut self.error_op);
+    }
+
     fn handle_async(&mut self, msg: AsyncMsg) {
         match msg {
             AsyncMsg::DirListed { path, entries, .. } => {
@@ -1587,9 +1630,13 @@ impl App {
             }
             AsyncMsg::OpFail { op, file, err, remaining } => {
                 // R4: keep the process-bar entry in-operation and keep the
-                // OpRecord until the user skips or aborts. Skip/abort wiring
-                // lands in Task 3; until then the modal's keys just close it.
-                let _ = (op, file);
+                // OpRecord until the user skips or aborts; the error message
+                // is stored for the abort path.
+                let _ = file;
+                if let Some(rec) = self.ops.get_mut(&op) {
+                    rec.err = err.clone();
+                }
+                self.error_op = Some(op);
                 self.spf_error.open(err, remaining);
             }
             AsyncMsg::OpDone { op, cancelled } => {
@@ -1862,6 +1909,24 @@ fn plan_compress(location: &Path, sources: &[PathBuf]) -> CompressPlan {
         return CompressPlan::AlreadyExists { target, total };
     }
     CompressPlan::Spawn { target, total }
+}
+
+/// Core of Go `FileListErrorState.Abort`: cancel the worker, finish the
+/// process Failed with the error stored by `OpFail`, and drop the record.
+/// (The worker already stopped when it sent `Fail`, so no `OpDone` follows.)
+fn apply_abort(
+    processbar: &mut ProcessBar,
+    ops: &mut HashMap<u64, OpRecord>,
+    error_op: &mut Option<u64>,
+) {
+    let op_id = match error_op.take() {
+        Some(id) => id,
+        None => return,
+    };
+    if let Some(rec) = ops.remove(&op_id) {
+        rec.cancel.store(true, Ordering::Relaxed);
+        processbar.finish(op_id, State::Failed, Some(rec.err));
+    }
 }
 
 fn processbar_operation(kind: OpKind) -> Operation {
@@ -2299,5 +2364,43 @@ mod tests {
             _ => panic!("empty base must plan Notify"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_abort_finishes_process_failed_with_message() {
+        // Go FileListErrorState.Abort: the process-bar entry becomes Failed
+        // with the error stored by OpFail, the worker's cancel flag is set,
+        // and the OpRecord is dropped (R4 lifecycle end).
+        let mut pb = ProcessBar::new();
+        pb.add(7, processbar_operation(OpKind::Copy), "missing.txt", 3)
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ops: HashMap<u64, OpRecord> = HashMap::new();
+        ops.insert(
+            7,
+            OpRecord {
+                kind: OpKind::Copy,
+                dest: PathBuf::from("/tmp/dest"),
+                cancel: cancel.clone(),
+                total: 3,
+                use_trash: false,
+                err: "copy failed: No such file or directory".to_string(),
+            },
+        );
+        let mut error_op = Some(7u64);
+
+        apply_abort(&mut pb, &mut ops, &mut error_op);
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(ops.is_empty());
+        assert_eq!(error_op, None);
+        assert_eq!(
+            pb.process_status(7),
+            Some((
+                State::Failed,
+                "copy failed: No such file or directory".to_string()
+            ))
+        );
+        assert!(!pb.has_running());
     }
 }
