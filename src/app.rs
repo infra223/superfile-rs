@@ -146,8 +146,9 @@ pub struct App {
 }
 
 /// One live background file operation: what it is, where it writes, its
-/// cancel flag (shared with the worker), and its total item/file count.
-/// `dest`/`cancel`/`total` drive the skip/abort resume flow (Task 3).
+/// cancel flag (shared with the worker), its total item/file count, the
+/// trash backend choice, and the error message stored by `OpFail` (reported
+/// when the user aborts). These drive the skip/abort resume flow.
 struct OpRecord {
     kind: OpKind,
     #[allow(dead_code)]
@@ -156,6 +157,10 @@ struct OpRecord {
     cancel: Arc<AtomicBool>,
     #[allow(dead_code)]
     total: usize,
+    #[allow(dead_code)]
+    use_trash: bool,
+    #[allow(dead_code)]
+    err: String,
 }
 
 impl App {
@@ -601,7 +606,9 @@ impl App {
                     if value.is_empty() {
                         return;
                     }
-                    self.spawn_op(OpKind::Create, vec![create_target(&location, &value)], location, false);
+                    let items = vec![create_target(&location, &value)];
+                    let total = fileops::op_total(OpKind::Create, &items);
+                    self.spawn_op(OpKind::Create, items, location, total, false);
                 }
                 dialogs::TypingAction::None => {}
             }
@@ -882,7 +889,7 @@ impl App {
             return;
         }
         if keys::matches_any(&self.hotkeys.compress_file, k) {
-            // TODO(task-B)
+            self.compress_trigger();
             return;
         }
         if keys::matches_any(&self.hotkeys.open_command_line, k) {
@@ -1388,7 +1395,9 @@ impl App {
             self.notify.open("Invalid paste location".to_string(), err, ConfirmAction::NoAction);
             return;
         }
-        self.spawn_op(if cut { OpKind::Cut } else { OpKind::Copy }, items, dest, false);
+        let kind = if cut { OpKind::Cut } else { OpKind::Copy };
+        let total = fileops::op_total(kind, &items);
+        self.spawn_op(kind, items, dest, total, false);
     }
 
     /// Go `getDeleteTriggerCmd`: guard the panel state, then open the notify
@@ -1423,31 +1432,102 @@ impl App {
         let use_trash = allow_trash && fileops::has_trash() && fileops::trash_available_for(&location);
         // Go: dest is unused by the delete processor; the panel location is
         // kept for the OpRecord.
-        self.spawn_op(OpKind::Delete, items, location, use_trash);
+        let total = fileops::op_total(OpKind::Delete, &items);
+        self.spawn_op(OpKind::Delete, items, location, total, use_trash);
+    }
+
+    /// Go `getCompressSelectedFilesCmd`: sources are the selected items in
+    /// visible order, or the focused item when nothing is selected; the zip
+    /// name comes from the first source's base name.
+    fn compress_trigger(&mut self) {
+        let panel = self.group.focused_panel();
+        if panel.empty() {
+            return;
+        }
+        let sources: Vec<PathBuf> = if panel.selected_count() > 0 {
+            panel.selected_paths()
+        } else {
+            panel.cursor_entry().map(|e| vec![e.path.clone()]).unwrap_or_default()
+        };
+        let location = panel.location.clone();
+        match plan_compress(&location, &sources) {
+            CompressPlan::Notify { title, content } => {
+                self.notify.open(title.to_string(), content, ConfirmAction::NoAction);
+            }
+            CompressPlan::AlreadyExists { target, total } => {
+                // R6 (Go `zipSources` duplicate block): add the process,
+                // then immediately finish it Cancelled.
+                self.io_req += 1;
+                let op_id = self.io_req;
+                let name = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = self
+                    .processbar
+                    .add(op_id, Operation::Compress, &name, total as u64);
+                self.processbar
+                    .finish(op_id, State::Cancelled, Some("File already exists".to_string()));
+            }
+            CompressPlan::Spawn { target, total } => {
+                self.spawn_op(OpKind::Compress, sources, target, total, false);
+            }
+        }
     }
 
     /// Go executePasteOperation et al. — register the process-bar entry,
     /// spawn the worker, and bridge its `WorkerMsg`s to the UI as `AsyncMsg`s
     /// (`Progress -> OpProgress`, `Fail -> OpFail`, `Done -> OpDone`).
-    fn spawn_op(&mut self, kind: OpKind, items: Vec<PathBuf>, dest: PathBuf, use_trash: bool) {
+    /// `total` is the process total (Go `op_total` for paste/delete/create,
+    /// the compress validation count for Compress).
+    fn spawn_op(
+        &mut self,
+        kind: OpKind,
+        items: Vec<PathBuf>,
+        dest: PathBuf,
+        total: usize,
+        use_trash: bool,
+    ) {
         if items.is_empty() {
             return;
         }
         self.io_req += 1;
         let op_id = self.io_req;
         let cancel = Arc::new(AtomicBool::new(false));
-        // R2: paste totals are recursive file counts; other ops count items.
-        // Computed once here and shared with the worker (process-bar entry).
-        let total = fileops::op_total(kind, &items);
-        let name = items[0]
+        // Go process names: compress shows the zip target, everything else
+        // the first source's base name.
+        let name_src = if kind == OpKind::Compress { &dest } else { &items[0] };
+        let name = name_src
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| items[0].display().to_string());
+            .unwrap_or_else(|| name_src.display().to_string());
 
         let (wtx, wrx) = mpsc::channel::<WorkerMsg>();
-        fileops::spawn_worker(kind, op_id, items, dest.clone(), cancel.clone(), wtx, total, use_trash);
+        fileops::spawn_worker(
+            kind, op_id, items, dest.clone(), cancel.clone(), wtx, total, 0, use_trash,
+        );
+        self.bridge_worker(wrx, cancel.clone());
+
+        let _ = self
+            .processbar
+            .add(op_id, processbar_operation(kind), &name, total as u64);
+        self.ops.insert(
+            op_id,
+            OpRecord {
+                kind,
+                dest,
+                cancel,
+                total,
+                use_trash,
+                err: String::new(),
+            },
+        );
+    }
+
+    /// Forward a worker's `WorkerMsg`s into the UI channel (also used when
+    /// resuming after Skip).
+    fn bridge_worker(&mut self, wrx: mpsc::Receiver<WorkerMsg>, cancel_flag: Arc<AtomicBool>) {
         let utx = self.tx.clone();
-        let cancel_flag = cancel.clone();
         std::thread::spawn(move || {
             for msg in wrx.iter() {
                 let ui = match msg {
@@ -1466,11 +1546,6 @@ impl App {
                 }
             }
         });
-
-        let _ = self
-            .processbar
-            .add(op_id, processbar_operation(kind), &name, total as u64);
-        self.ops.insert(op_id, OpRecord { kind, dest, cancel, total });
     }
 
     fn handle_async(&mut self, msg: AsyncMsg) {
@@ -1721,6 +1796,50 @@ impl App {
 // ----------------------------------------------------------------------
 
 /// Map an op kind to its process-bar operation type.
+/// Outcome of the Go `getCompressSelectedFilesCmd` pre-flight checks
+/// (`getZipArchiveName` + `validateCompressOperation` + the R6 duplicate
+/// target rule).
+enum CompressPlan {
+    /// Spawn the Compress worker for this explicit zip target.
+    Spawn { target: PathBuf, total: usize },
+    /// Notify modal (Go "Invalid zip target name" / "Invalid file/dir to
+    /// compress").
+    Notify { title: &'static str, content: String },
+    /// R6: the target exists — add the process, finish it Cancelled.
+    AlreadyExists { target: PathBuf, total: usize },
+}
+
+fn plan_compress(location: &Path, sources: &[PathBuf]) -> CompressPlan {
+    let base = sources
+        .first()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let zip_name = match fileops::zip_archive_name(&base) {
+        Ok(n) => n,
+        Err(err) => {
+            return CompressPlan::Notify {
+                title: "Invalid zip target name",
+                content: err,
+            }
+        }
+    };
+    let target = location.join(&zip_name);
+    let total = match fileops::validate_compress_sources(sources) {
+        Ok(t) => t,
+        Err(err) => {
+            return CompressPlan::Notify {
+                title: "Invalid file/dir to compress",
+                content: err,
+            }
+        }
+    };
+    if target.exists() {
+        return CompressPlan::AlreadyExists { target, total };
+    }
+    CompressPlan::Spawn { target, total }
+}
+
 fn processbar_operation(kind: OpKind) -> Operation {
     match kind {
         OpKind::Copy => Operation::Copy,
@@ -2089,5 +2208,72 @@ mod tests {
         panel.selected = vec![PathBuf::from("/tmp/a.txt")];
         apply_op_effects(&mut clipboard, OpKind::Copy, State::Successful, &mut panel);
         assert_eq!(panel.selected_count(), 1);
+    }
+
+    #[test]
+    fn test_plan_compress_duplicate_target_cancelled() {
+        // R6: an existing zip target is a Cancelled process
+        // ("File already exists"), not a rename — checked after validation,
+        // like Go zipSources' stat block.
+        let dir = std::env::temp_dir().join(format!("spf_compress_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.zip"), "old").unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+
+        match plan_compress(&dir, &[dir.join("a.txt")]) {
+            CompressPlan::AlreadyExists { target, total } => {
+                assert_eq!(target, dir.join("a.zip"));
+                assert_eq!(total, 1);
+            }
+            _ => panic!("duplicate target must plan AlreadyExists"),
+        }
+        // The existing zip is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join("a.zip")).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plan_compress_naming_and_validation() {
+        let dir = std::env::temp_dir().join(format!("spf_compress_plan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+        std::fs::write(dir.join("tree/sub/b.txt"), "x").unwrap();
+
+        // R10: dotfile base keeps its full name (.gitignore -> .gitignore.zip).
+        match plan_compress(&dir, &[dir.join(".gitignore")]) {
+            CompressPlan::Spawn { target, total } => {
+                assert_eq!(target, dir.join(".gitignore.zip"));
+                assert_eq!(total, 1);
+            }
+            _ => panic!(".gitignore must plan Spawn"),
+        }
+        // Recursive readable count feeds the process total.
+        match plan_compress(&dir, &[dir.join("tree"), dir.join(".gitignore")]) {
+            CompressPlan::Spawn { target, total } => {
+                assert_eq!(target, dir.join("tree.zip"));
+                assert_eq!(total, 2);
+            }
+            _ => panic!("tree must plan Spawn"),
+        }
+        // Go validateCompressOperation failure -> notify wording.
+        match plan_compress(&dir, &[dir.join("nope.txt")]) {
+            CompressPlan::Notify { title, content } => {
+                assert_eq!(title, "Invalid file/dir to compress");
+                assert!(content.contains("source path does not exist"), "{content}");
+            }
+            _ => panic!("missing source must plan Notify"),
+        }
+        // Go getZipArchiveName failure -> notify wording.
+        match plan_compress(&dir, &[]) {
+            CompressPlan::Notify { title, content } => {
+                assert_eq!(title, "Invalid zip target name");
+                assert_eq!(content, "empty filename to compress");
+            }
+            _ => panic!("empty base must plan Notify"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

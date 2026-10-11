@@ -141,9 +141,16 @@ pub enum WorkerMsg {
 /// per-file progress. Every op ends with a final `Progress { done: total }`
 /// (Go `process.Done = process.Total` before `markProcessDone`).
 ///
-/// `total` is computed once by the caller (`op_total`) and shared with the
-/// process-bar entry; `use_trash` selects the trash backend for `Delete`
-/// (Go `makeDeleteProcessor`'s `deleteFunc` choice).
+/// `total` is computed once by the caller (`op_total`, or the compress
+/// validation) and shared with the process-bar entry; `done_offset` is the
+/// progress already reported when resuming after Skip (R5; 0 for fresh
+/// ops); `use_trash` selects the trash backend for `Delete` (Go
+/// `makeDeleteProcessor`'s `deleteFunc` choice).
+///
+/// `Compress` is a single process over all `items` (Go `zipSources`): one
+/// archive written to `dest` (the explicit target path) with per-entry
+/// progress. `Extract` unpacks `items[0]` into `dest` (the explicit output
+/// directory).
 pub fn spawn_worker(
     kind: OpKind,
     op_id: u64,
@@ -152,6 +159,7 @@ pub fn spawn_worker(
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
     total: usize,
+    done_offset: usize,
     use_trash: bool,
 ) {
     std::thread::spawn(move || {
@@ -172,7 +180,53 @@ pub fn spawn_worker(
             }
         }
 
-        let mut done: usize = 0;
+        let mut done: usize = done_offset;
+
+        // Compress is one process over all sources (Go `zipSources`): a
+        // single archive at `dest` with per-entry progress; a walk failure
+        // fails the process outright (no resume list, Go `zipSourcesCore`).
+        if kind == OpKind::Compress {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(WorkerMsg::Done { op: op_id });
+                return;
+            }
+            let mut last_file = String::new();
+            let res = {
+                let mut cb = |p: &Path| {
+                    done += 1;
+                    last_file = base_name(p);
+                    let _ = tx.send(WorkerMsg::Progress {
+                        op: op_id,
+                        file: last_file.clone(),
+                        done,
+                        total,
+                    });
+                };
+                compress_items(&items, &dest, Some(&mut cb)).map_err(|e| e.to_string())
+            };
+            match res {
+                Ok(()) => {
+                    // Go: p.Done = totalFiles before the final update.
+                    let _ = tx.send(WorkerMsg::Progress {
+                        op: op_id,
+                        file: last_file,
+                        done: total,
+                        total,
+                    });
+                    let _ = tx.send(WorkerMsg::Done { op: op_id });
+                }
+                Err(err) => {
+                    let _ = tx.send(WorkerMsg::Fail {
+                        op: op_id,
+                        file: base_name(&dest),
+                        err,
+                        remaining: Vec::new(),
+                    });
+                }
+            }
+            return;
+        }
+
         for (i, item) in items.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerMsg::Done { op: op_id });
@@ -192,7 +246,7 @@ pub fn spawn_worker(
                 }
                 OpKind::Delete => delete_item(item, use_trash).map_err(|e| e.to_string()).map(|_| done += 1),
                 OpKind::Create => create_item(item).map_err(|e| e.to_string()).map(|_| done += 1),
-                OpKind::Compress => compress_items(&[item.clone()], &dest).map(|_| done += 1).map_err(|e| e.to_string()),
+                OpKind::Compress => unreachable!("Compress runs as a single process above"),
                 OpKind::Extract => extract_archive(item).map(|_| done += 1).map_err(|e| e.to_string()),
             };
             match res {
@@ -241,7 +295,11 @@ pub fn op_total(kind: OpKind, items: &[PathBuf]) -> usize {
     }
 }
 
-/// Re-run a worker on the remaining items after the user pressed "Skip".
+/// Re-run a worker on the remaining items after the user pressed "Skip"
+/// (Go `FileListErrorState.Skip` -> `runFileProcessor` with `fileList[1:]`).
+/// `total` is the original process total and `done_offset` the progress
+/// already reported (R5: `total - remaining.len()`); neither is recomputed
+/// from `remaining`.
 #[allow(dead_code)] // wired by the skip/abort flow (Task 3)
 pub fn spawn_remaining(
     kind: OpKind,
@@ -250,11 +308,12 @@ pub fn spawn_remaining(
     dest: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
+    total: usize,
+    done_offset: usize,
     use_trash: bool,
 ) {
     let items: Vec<PathBuf> = remaining.iter().map(|s| PathBuf::from(s)).collect();
-    let total = op_total(kind, &items);
-    spawn_worker(kind, op_id, items, dest, cancel, tx, total, use_trash);
+    spawn_worker(kind, op_id, items, dest, cancel, tx, total, done_offset, use_trash);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,27 +532,112 @@ pub fn is_extractable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn compress_archive_name(items: &[PathBuf], dest_dir: &Path) -> PathBuf {
-    let base = if items.len() == 1 {
-        items[0]
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "archive".into())
-    } else {
-        "items".to_string()
+/// Go `getZipArchiveName` minus the `renameIfDuplicate` step: the app turns
+/// an existing target into a Cancelled process instead (R6). `base` is the
+/// first source's base name: strip the last extension (Go `filepath.Ext`)
+/// and append `.zip`; a base starting with `.` that contains exactly one
+/// `.` keeps its full name (`.gitignore` -> `.gitignore.zip`).
+pub fn zip_archive_name(base: &str) -> Result<String, String> {
+    if base.is_empty() {
+        return Err("empty filename to compress".to_string());
+    }
+    let ext = match base.rfind('.') {
+        Some(i) => &base[i..],
+        None => "",
     };
-    unique_target(dest_dir.join(format!("{base}.zip")))
+    let mut zip_name = format!("{}.zip", &base[..base.len() - ext.len()]);
+    if base.starts_with('.') && base.matches('.').count() == 1 {
+        zip_name = format!("{base}.zip");
+    }
+    Ok(zip_name)
 }
 
-pub fn compress_items(items: &[PathBuf], dest_dir: &Path) -> std::io::Result<PathBuf> {
-    let out = compress_archive_name(items, dest_dir);
-    let file = std::fs::File::create(&out)?;
+/// Go `validateCompressOperation`: every source must exist and be
+/// accessible, plain files must be readable, and the recursive readable
+/// file count is computed. Error strings match Go.
+pub fn validate_compress_sources(sources: &[PathBuf]) -> Result<usize, String> {
+    let mut total = 0usize;
+    for src in sources {
+        match std::fs::metadata(src) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("source path does not exist: {}", src.display()));
+            }
+            Err(e) => {
+                return Err(format!("cannot access source path {}: {e}", src.display()));
+            }
+            Ok(m) => {
+                if !m.is_dir() {
+                    if let Err(e) = check_file_readable(src) {
+                        return Err(format!("the file is not readable: {e}"));
+                    }
+                }
+            }
+        }
+        total += match count_readable_files(src) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(format!(
+                    "error while counting files for {}: {e}",
+                    src.display()
+                ));
+            }
+        };
+    }
+    Ok(total)
+}
+
+/// Go `checkFileReadable`.
+fn check_file_readable(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path).map(|_| ())
+}
+
+/// Go `countReadableFiles`: recursive count of readable non-directories
+/// (symlinks count as one entry, like `filepath.Walk`); any unreadable
+/// entry aborts the count with an error.
+pub fn count_readable_files(path: &Path) -> Result<usize, String> {
+    let lmeta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !lmeta.is_dir() {
+        check_file_readable(path).map_err(|e| e.to_string())?;
+        return Ok(1);
+    }
+    let mut count = 0usize;
+    let rd = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+    for entry in rd {
+        let p = entry.map_err(|e| e.to_string())?.path();
+        let lmeta = std::fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+        if lmeta.is_dir() {
+            count += count_readable_files(&p)?;
+        } else {
+            check_file_readable(&p).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Zip `items` into the explicit `target` path (Go `zipSources` +
+/// `zipSourcesCore`): each source is stored relative to its own parent,
+/// directories get a trailing-slash entry, symlinks are stored as their
+/// link text. `progress` is invoked once per entry written (Go `p.Done++`
+/// after `writeZipFile`). No dedup naming — the caller checked the target
+/// (R6).
+pub fn compress_items(
+    items: &[PathBuf],
+    target: &Path,
+    progress: Option<&mut dyn FnMut(&Path)>,
+) -> std::io::Result<()> {
+    let mut sink = |_p: &Path| {};
+    let cb: &mut dyn FnMut(&Path) = match progress {
+        Some(f) => f,
+        None => &mut sink,
+    };
+    let file = std::fs::File::create(target)?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    let base = common_parent(items);
     for item in items {
-        let _rel = item.strip_prefix(&base).unwrap_or(item);
+        // Go zipSourcesCore: relPath is relative to each source's own parent.
+        let base = item.parent().unwrap_or(Path::new("")).to_path_buf();
         let mut stack = vec![item.to_path_buf()];
         while let Some(p) = stack.pop() {
             let lmeta = std::fs::symlink_metadata(&p)?;
@@ -513,32 +657,11 @@ pub fn compress_items(items: &[PathBuf], dest_dir: &Path) -> std::io::Result<Pat
                 zip.start_file(relp.display().to_string(), options)?;
                 zip.write_all(&data)?;
             }
+            cb(&p);
         }
     }
     zip.finish()?;
-    Ok(out)
-}
-
-fn common_parent(items: &[PathBuf]) -> PathBuf {
-    if items.is_empty() {
-        return PathBuf::from(".");
-    }
-    let mut parent = items[0].parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    for item in items {
-        let p = item.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        while !p.starts_with(&parent) && !parent.starts_with(&p) {
-            parent = parent_of(&parent);
-            if parent.as_os_str().is_empty() {
-                parent = PathBuf::from("/");
-                break;
-            }
-        }
-    }
-    if parent.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        parent
-    }
+    Ok(())
 }
 
 /// Extract an archive into a sibling directory named after it.
@@ -992,6 +1115,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             tx,
             op_total(OpKind::Copy, &[src_root.join("tree")]),
+            0,
             false,
         );
         let msgs = collect_worker_msgs(rx);
@@ -1038,6 +1162,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             tx,
             2,
+            0,
             false,
         );
         let msgs = collect_worker_msgs(rx);
@@ -1078,6 +1203,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             tx,
             2,
+            0,
             false,
         );
         let msgs = collect_worker_msgs(rx);
@@ -1223,5 +1349,127 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&at_cap).unwrap(), "keep");
         assert_eq!(std::fs::read_to_string(&huge).unwrap(), "keep2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- zip_archive_name (Go getZipArchiveName) -------------------------
+
+    #[test]
+    fn zip_archive_name_rules() {
+        // Strip the last extension + ".zip".
+        assert_eq!(zip_archive_name("notes.txt").unwrap(), "notes.zip");
+        assert_eq!(zip_archive_name("a.tar.gz").unwrap(), "a.tar.zip");
+        assert_eq!(zip_archive_name("plain").unwrap(), "plain.zip");
+        // Dotfile with exactly one dot keeps its full name.
+        assert_eq!(zip_archive_name(".gitignore").unwrap(), ".gitignore.zip");
+        // More than one dot: normal rule applies.
+        assert_eq!(zip_archive_name(".hidden.tar").unwrap(), ".hidden.zip");
+        assert_eq!(
+            zip_archive_name("").unwrap_err(),
+            "empty filename to compress"
+        );
+    }
+
+    // ---- validate_compress_sources (Go validateCompressOperation) --------
+
+    #[test]
+    fn validate_compress_sources_counts_recursively() {
+        let dir = temp_dir("compress_validate");
+        touch(&dir, "a.txt");
+        touch(&dir, "tree/b.txt");
+        touch(&dir, "tree/sub/c.txt");
+        std::fs::create_dir_all(dir.join("emptydir")).unwrap();
+
+        assert_eq!(validate_compress_sources(&[dir.clone()]).unwrap(), 3);
+        assert_eq!(
+            validate_compress_sources(&[dir.join("a.txt"), dir.join("tree")]).unwrap(),
+            3
+        );
+
+        let missing = dir.join("nope.txt");
+        let err = validate_compress_sources(&[missing.clone()]).unwrap_err();
+        assert_eq!(err, format!("source path does not exist: {}", missing.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- compress_items (Go zipSources/zipSourcesCore) -------------------
+
+    #[test]
+    fn compress_items_writes_explicit_target_with_progress() {
+        let src_root = temp_dir("compress_src");
+        touch(&src_root, "tree/a.txt");
+        touch(&src_root, "tree/sub/b.txt");
+        let target = temp_dir("compress_dest").join("tree.zip");
+
+        let mut seen: Vec<String> = Vec::new();
+        compress_items(&[src_root.join("tree")], &target, Some(&mut |p: &Path| {
+            seen.push(p.file_name().unwrap().to_string_lossy().to_string());
+        }))
+        .unwrap();
+
+        assert!(target.is_file());
+        // Progress per entry written (Go p.Done++): the source itself, the
+        // nested dir, and both files.
+        assert_eq!(seen.len(), 4);
+        assert!(seen.contains(&"tree".to_string()));
+        assert!(seen.contains(&"a.txt".to_string()));
+        assert!(seen.contains(&"sub".to_string()));
+        assert!(seen.contains(&"b.txt".to_string()));
+
+        // Entries are relative to each source's own parent (Go relPath).
+        let f = std::fs::File::open(&target).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["tree/", "tree/a.txt", "tree/sub/", "tree/sub/b.txt"]
+        );
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(target.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_compress_is_single_process_with_progress() {
+        let src_root = temp_dir("worker_compress_src");
+        touch(&src_root, "a.txt");
+        touch(&src_root, "tree/b.txt");
+        touch(&src_root, "tree/c.txt");
+        let dest_dir = temp_dir("worker_compress_dest");
+        let target = dest_dir.join("a.zip");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Compress,
+            7,
+            vec![src_root.join("a.txt"), src_root.join("tree")],
+            target.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            3, // validation total (readable files); dir entries overshoot like Go
+            0,
+            false,
+        );
+        let msgs = collect_worker_msgs(rx);
+
+        // Per-entry progress (Go p.Done++ counts dir entries too), then the
+        // final update forces done = total (Go p.Done = totalFiles).
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, total, .. } => {
+                    assert_eq!(*total, 3);
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones, vec![1, 2, 3, 4, 3]);
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 7 })));
+
+        assert!(target.is_file());
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dest_dir);
     }
 }
