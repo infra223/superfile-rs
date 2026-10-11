@@ -885,7 +885,7 @@ impl App {
             return;
         }
         if keys::matches_any(&self.hotkeys.extract_file, k) {
-            // TODO(task-B)
+            self.extract_trigger();
             return;
         }
         if keys::matches_any(&self.hotkeys.compress_file, k) {
@@ -1473,6 +1473,30 @@ impl App {
                 self.spawn_op(OpKind::Compress, sources, target, total, false);
             }
         }
+    }
+
+    /// Go `getExtractFileCmd`: the focused item, gated on its lowercased
+    /// last extension; output dir = `file_name_without_extension` +
+    /// `unique_target`, created before the worker starts (Go `MkdirAll`).
+    fn extract_trigger(&mut self) {
+        let panel = self.group.focused_panel();
+        if panel.empty() {
+            return;
+        }
+        let item = match panel.cursor_entry() {
+            Some(e) => e.path.clone(),
+            None => return,
+        };
+        if !fileops::is_extractable(&item) {
+            return; // Go: logs and returns no cmd for non-extractable extensions
+        }
+        let dest = fileops::unique_target(fileops::file_name_without_extension(&item));
+        if std::fs::create_dir_all(&dest).is_err() {
+            return; // Go: MkdirAll failure -> Failed msg without a process entry
+        }
+        let items = vec![item];
+        let total = fileops::op_total(OpKind::Extract, &items);
+        self.spawn_op(OpKind::Extract, items, dest, total, false);
     }
 
     /// Go executePasteOperation et al. — register the process-bar entry,

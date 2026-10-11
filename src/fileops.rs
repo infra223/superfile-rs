@@ -86,9 +86,6 @@ pub fn parent_of(p: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Delete/Create/Compress/Extract are constructed by the delete/create/
-// compress/extract triggers (later Task B tasks).
-#[allow(dead_code)]
 pub enum OpKind {
     Copy,
     Cut,
@@ -96,20 +93,6 @@ pub enum OpKind {
     Create,
     Compress,
     Extract,
-}
-
-impl OpKind {
-    #[allow(dead_code)] // reserved for process-bar labels
-    pub fn label(&self) -> &'static str {
-        match self {
-            OpKind::Copy => "copy",
-            OpKind::Cut => "cut",
-            OpKind::Delete => "delete",
-            OpKind::Create => "create",
-            OpKind::Compress => "compress",
-            OpKind::Extract => "extract",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -247,7 +230,7 @@ pub fn spawn_worker(
                 OpKind::Delete => delete_item(item, use_trash).map_err(|e| e.to_string()).map(|_| done += 1),
                 OpKind::Create => create_item(item).map_err(|e| e.to_string()).map(|_| done += 1),
                 OpKind::Compress => unreachable!("Compress runs as a single process above"),
-                OpKind::Extract => extract_archive(item).map(|_| done += 1).map_err(|e| e.to_string()),
+                OpKind::Extract => extract_archive(item, &dest).map_err(|e| e.to_string()).map(|_| done += 1),
             };
             match res {
                 Ok(()) => {
@@ -516,20 +499,32 @@ pub fn trash_move(src: &Path) -> std::io::Result<()> {
 // Zip / extract
 // ---------------------------------------------------------------------------
 
-// Consumed by the compress/extract triggers (Task 3).
-#[allow(dead_code)]
-pub const EXTRACTABLE_EXTS: &[&str] = &["zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "7z", "rar", "zst", "lz"];
+/// Go `IsExtensionExtractable` set (matched against the lowercased LAST
+/// extension, like Go's `filepath.Ext`: `.xz`, `.tgz` and `.bz2` are NOT
+/// extractable; `.tar.gz` is, via its `.gz` suffix).
+pub const EXTRACTABLE_EXTS: &[&str] = &["zip", "bz", "gz", "iso", "rar", "7z", "tar"];
 
-#[allow(dead_code)] // used by the extract trigger (Task 3)
 pub fn is_extractable(path: &Path) -> bool {
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".tar.gz") {
-        return true;
-    }
     path.extension()
         .map(|e| EXTRACTABLE_EXTS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Go `FileNameWithoutExtension`: strip every trailing dot-suffix from the
+/// base name (a leading dot is kept: `.hidden.zip` -> `.hidden`,
+/// `.gitignore` -> `.gitignore`), re-joined with the parent directory.
+pub fn file_name_without_extension(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    loop {
+        match name.rfind('.') {
+            Some(pos) if pos > 0 => name.truncate(pos),
+            _ => break,
+        }
+    }
+    path.parent().unwrap_or(Path::new("")).join(name)
 }
 
 /// Go `getZipArchiveName` minus the `renameIfDuplicate` step: the app turns
@@ -664,36 +659,34 @@ pub fn compress_items(
     Ok(())
 }
 
-/// Extract an archive into a sibling directory named after it.
-pub fn extract_archive(path: &Path) -> std::io::Result<PathBuf> {
+/// Extract an archive into the explicit output directory `dest` (Go
+/// `extractCompressFile` with `xtractr.OutputDir`; the caller derives `dest`
+/// from `file_name_without_extension` + `unique_target` and creates it).
+pub fn extract_archive(path: &Path, dest: &Path) -> std::io::Result<()> {
     let lower = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let stem = if lower.ends_with(".tar.gz") || lower.ends_with(".tar.bz2") || lower.ends_with(".tar.xz") {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_suffix(".tar"))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "extracted".into())
-    } else {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "extracted".into())
-    };
-    let dest_dir = path.parent().unwrap_or(Path::new("."));
-    let dest = unique_target(dest_dir.join(&stem));
-
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     match ext.as_str() {
-        "zip" => extract_zip(path, &dest)?,
-        "tar" => extract_tar(path, &dest, None)?,
-        "gz" | "tgz" => {
-            if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-                extract_tar(path, &dest, Some(flate2::Compression::default()))?
+        "zip" => extract_zip(path, dest)?,
+        "tar" => extract_tar(path, dest, None)?,
+        "gz" => {
+            if lower.ends_with(".tar.gz") {
+                extract_tar(path, dest, Some(flate2::Compression::default()))?
             } else {
-                let out = unique_target(dest_dir.join(&stem));
+                // Plain gz: the single decoded file lands inside the output
+                // dir (xtractr semantics).
+                std::fs::create_dir_all(dest)?;
+                let stem = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "extracted".into());
+                let out = dest.join(stem);
                 let f = std::fs::File::create(&out)?;
                 let mut src = std::fs::File::open(path)?;
                 let mut g = flate2::write::GzDecoder::new(f);
@@ -706,13 +699,12 @@ pub fn extract_archive(path: &Path) -> std::io::Result<PathBuf> {
             let tool = match ext.as_str() {
                 "7z" => "7z",
                 "rar" => "unrar",
-                "bz2" | "tbz2" | "xz" | "lz" | "zst" => "tar",
                 _ => "bsdtar",
             };
-            run_external_extract(tool, path, &dest)?;
+            run_external_extract(tool, path, dest)?;
         }
     }
-    Ok(dest)
+    Ok(())
 }
 
 fn extract_zip(path: &Path, dest: &Path) -> std::io::Result<()> {
@@ -1471,5 +1463,87 @@ mod tests {
         assert!(target.is_file());
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    // ---- extract gate + naming (Go IsExtensionExtractable /
+    //      FileNameWithoutExtension) --------------------------------------
+
+    #[test]
+    fn is_extractable_gate_list() {
+        // R7: {zip, bz, gz, iso, rar, 7z, tar} on the last extension.
+        for name in ["a.zip", "a.bz", "a.gz", "a.iso", "a.rar", "a.7z", "a.tar"] {
+            assert!(is_extractable(Path::new(name)), "{name}");
+        }
+        // Uppercase is lowercased like Go.
+        assert!(is_extractable(Path::new("A.ZIP")));
+        // .tar.gz is extractable via its .gz suffix.
+        assert!(is_extractable(Path::new("a.tar.gz")));
+        // NOT in the set: .xz, .tgz, .bz2 (and friends).
+        for name in ["a.xz", "a.tgz", "a.bz2", "a.zst", "a.tar.bz2", "a.txt", "noext"] {
+            assert!(!is_extractable(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn file_name_without_extension_strips_all_suffixes() {
+        // R8: strip every trailing dot-suffix, keep a leading dot.
+        let dir = Path::new("/p");
+        assert_eq!(file_name_without_extension(&dir.join("a.tar.gz")), dir.join("a"));
+        assert_eq!(file_name_without_extension(&dir.join("a.b.c")), dir.join("a"));
+        assert_eq!(file_name_without_extension(&dir.join(".hidden.zip")), dir.join(".hidden"));
+        assert_eq!(file_name_without_extension(&dir.join(".gitignore")), dir.join(".gitignore"));
+        assert_eq!(file_name_without_extension(&dir.join("plain")), dir.join("plain"));
+        // Extract output dir dedups with the Go (N) format (R1).
+        let tmp = temp_dir("extract_naming");
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        let stripped = file_name_without_extension(&tmp.join("a.zip"));
+        assert_eq!(unique_target(stripped), tmp.join("a(1)"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn worker_extract_round_trip_into_explicit_dest() {
+        let src = temp_dir("extract_rt_src");
+        touch(&src, "tree/a.txt");
+        touch(&src, "tree/sub/b.txt");
+        let work = temp_dir("extract_rt_work");
+        let archive = work.join("tree.zip");
+        compress_items(&[src.join("tree")], &archive, None).unwrap();
+
+        // Trigger-side naming: strip-all-suffixes + unique_target.
+        let dest = unique_target(file_name_without_extension(&archive));
+        assert_eq!(dest, work.join("tree"));
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Extract,
+            8,
+            vec![archive.clone()],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            1, // Go extractCompressFile total is 1
+            0,
+            false,
+        );
+        let msgs = collect_worker_msgs(rx);
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, total, .. } => {
+                    assert_eq!(*total, 1);
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.last(), Some(&1));
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 8 })));
+
+        assert!(dest.join("tree/a.txt").is_file());
+        assert!(dest.join("tree/sub/b.txt").is_file());
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
