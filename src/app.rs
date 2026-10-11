@@ -601,7 +601,7 @@ impl App {
                     if value.is_empty() {
                         return;
                     }
-                    self.spawn_op(OpKind::Create, vec![location.join(&value)], location, false);
+                    self.spawn_op(OpKind::Create, vec![create_target(&location, &value)], location, false);
                 }
                 dialogs::TypingAction::None => {}
             }
@@ -1741,6 +1741,13 @@ fn apply_paste_effects(clipboard: &mut Clipboard, kind: OpKind, state: State) {
     }
 }
 
+/// Go `filepath.Join(location, typed)` parity: the typed value is always
+/// appended under the panel location, even when it starts with `/` (Rust
+/// `PathBuf::join` would *replace* the base for an absolute argument).
+fn create_target(location: &Path, typed: &str) -> PathBuf {
+    location.join(typed.trim_start_matches('/'))
+}
+
 /// Go `getDeleteTriggerCmd` wording selection: trash warning when the trash
 /// is usable and the hotkey was not the permanent-delete one, else the
 /// permanent warning.
@@ -2024,6 +2031,25 @@ mod tests {
             );
             assert_eq!(action, ConfirmAction::PermanentDelete);
         }
+    }
+
+    #[test]
+    fn test_create_target_absolute_typed_appends_under_location() {
+        // Review fix 2: Go filepath.Join appends the typed value under the
+        // panel directory even when it starts with '/'.
+        let loc = PathBuf::from("/tmp/panel");
+        assert_eq!(create_target(&loc, "/etc/passwd"), PathBuf::from("/tmp/panel/etc/passwd"));
+        assert_eq!(create_target(&loc, "a.txt"), PathBuf::from("/tmp/panel/a.txt"));
+        assert_eq!(create_target(&loc, "//x"), PathBuf::from("/tmp/panel/x"));
+        assert_eq!(create_target(&loc, "/"), PathBuf::from("/tmp/panel"));
+
+        // The target really lands under the panel directory (create_item).
+        let dir = std::env::temp_dir().join(format!("spf_create_abs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        fileops::create_item(&create_target(&dir, "/sub/x.txt")).unwrap();
+        assert!(dir.join("sub/x.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

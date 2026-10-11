@@ -349,12 +349,21 @@ pub fn create_item(path: &Path) -> std::io::Result<()> {
     if s.ends_with('/') {
         std::fs::create_dir_all(path)
     } else {
-        let path = unique_target(path.to_path_buf());
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let deduped = unique_target(path.to_path_buf());
+        if deduped == path && path.exists() {
+            // unique_target exhausted its 10_000 counter and returned the
+            // existing path: Go `renameIfDuplicate` errors here; opening it
+            // with truncate(true) would silently wipe the existing file.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("could not find free name for {} after many attempts", path.display()),
+            ));
+        }
+        let parent = deduped.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(p) = parent {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path)
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&deduped)
             .map(|_| ())
     }
 }
@@ -403,12 +412,17 @@ pub fn has_trash() -> bool {
 /// (Go's fallback), which this port does not create — reported unavailable
 /// so the delete flow falls back to permanent deletion.
 pub fn trash_available_for(path: &Path) -> bool {
-    let root = match trash_root() {
-        Some(r) => r,
-        None => return false,
-    };
+    match trash_root() {
+        Some(root) => trash_available_under(path, &root),
+        None => false,
+    }
+}
+
+/// `trash_available_for` with an explicit trash root (testable without
+/// touching the process-global environment).
+fn trash_available_under(path: &Path, root: &Path) -> bool {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let root_abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let root_abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if abs.starts_with(&root_abs) {
         return false;
     }
@@ -668,8 +682,9 @@ fn run_external_extract(tool: &str, path: &Path, dest: &Path) -> std::io::Result
 
 /// Go `renameIfDuplicate`: `dir/name.ext` -> `dir/name(1).ext`,
 /// `dir/name(2).ext`, ... resuming the counter from an existing `(N)` suffix
-/// (cap 10_000). On exhaustion returns the original path; the subsequent fs
-/// call then fails, mirroring Go's error path.
+/// (cap 10_000). On exhaustion returns the original path unchanged; callers
+/// must treat "unchanged + exists" as exhaustion (Go returns an error there)
+/// — `create_item` does, so it never truncates an existing file.
 pub fn unique_target(p: PathBuf) -> PathBuf {
     if !p.exists() {
         return p;
@@ -1088,8 +1103,13 @@ mod tests {
 
     // ---- trash_available_for (Go trash.Available approximation) ----------
 
+    /// Serializes the tests that manipulate the process-global
+    /// XDG_DATA_HOME (only these two touch it).
+    static TRASH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn trash_available_for_cross_device_false() {
+        let _guard = TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // /proc is procfs: a different st_dev than the XDG trash root (and
         // Go's per-mount .Trash-uid fallback is not implemented here).
         assert!(!trash_available_for(Path::new("/proc")));
@@ -1098,6 +1118,42 @@ mod tests {
             assert!(!trash_available_for(&root));
             assert!(!trash_available_for(&root.join("files")));
         }
+    }
+
+    #[test]
+    fn trash_available_for_positive_and_negatives() {
+        // Positive gate coverage with an explicit trash root (no env):
+        // same-device outside the trash -> true; inside -> false;
+        // cross-device -> false; missing root -> false.
+        let base = temp_dir("trash_gate");
+        let root = base.join("Trash");
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        let target = touch(&base, "home/file.txt");
+
+        assert!(trash_available_under(&target, &root));
+        assert!(!trash_available_under(&root, &root));
+        assert!(!trash_available_under(&root.join("files"), &root));
+        assert!(!trash_available_under(&root.join("files/x"), &root));
+        assert!(!trash_available_under(Path::new("/proc"), &root));
+
+        // Same gate through the env-driven entry point (serialized).
+        let _guard = TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &base);
+        let has = has_trash();
+        let ok = trash_available_for(&target);
+        let inside = trash_available_for(&root.join("files"));
+        let cross = trash_available_for(Path::new("/proc"));
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        assert!(has);
+        assert!(ok, "same-device path must be trash-available");
+        assert!(!inside);
+        assert!(!cross);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- create_item (Go createItem + checkFileNameValidity) -------------
@@ -1138,12 +1194,34 @@ mod tests {
     #[test]
     fn unique_target_huge_counter_like_go() {
         // T1-m3: Go parses the (N) suffix as int64. A counter beyond the
-        // 10_000 cap means no free name -> Go errors; here the original path
-        // is returned so the subsequent fs call fails (same op outcome).
+        // 10_000 cap means no free name -> Go errors; the helper returns the
+        // original path and `create_item` turns that into the same error
+        // (see create_item_exhausted_counter_errors_without_truncating).
         let dir = temp_dir("unique_huge");
         touch(&dir, "a(4294967296).txt"); // beyond u32, within u64
         let p = dir.join("a(4294967296).txt");
         assert_eq!(unique_target(p.clone()), p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_item_exhausted_counter_errors_without_truncating() {
+        // Review fix 1: at/above the 10_000 cap unique_target returns the
+        // original existing path; create_item must error (Go "could not find
+        // free name") instead of opening it with truncate(true).
+        let dir = temp_dir("create_exhaust");
+        let at_cap = touch(&dir, "a(9999).txt"); // counter 10_000 -> range empty
+        std::fs::write(&at_cap, "keep").unwrap();
+        let huge = touch(&dir, "b(4294967296).txt"); // beyond u32
+        std::fs::write(&huge, "keep2").unwrap();
+
+        for p in [&at_cap, &huge] {
+            let err = create_item(p).unwrap_err().to_string();
+            assert!(err.contains("could not find free name"), "{p:?}: {err}");
+        }
+        // Existing contents untouched.
+        assert_eq!(std::fs::read_to_string(&at_cap).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&huge).unwrap(), "keep2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
