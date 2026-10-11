@@ -1454,7 +1454,7 @@ impl App {
                 self.notify.open(title.to_string(), content, ConfirmAction::NoAction);
             }
             CompressPlan::AlreadyExists { target, total } => {
-                // R6 (Go `zipSources` duplicate block): add the process,
+                // Revised R6 (unique_target exhaustion): add the process,
                 // then immediately finish it Cancelled.
                 self.io_req += 1;
                 let op_id = self.io_req;
@@ -1869,15 +1869,16 @@ impl App {
 
 /// Map an op kind to its process-bar operation type.
 /// Outcome of the Go `getCompressSelectedFilesCmd` pre-flight checks
-/// (`getZipArchiveName` + `validateCompressOperation` + the R6 duplicate
-/// target rule).
+/// (`getZipArchiveName` incl. `renameIfDuplicate` + `validateCompressOperation`
+/// + the revised R6 exhaustion rule).
 enum CompressPlan {
     /// Spawn the Compress worker for this explicit zip target.
     Spawn { target: PathBuf, total: usize },
     /// Notify modal (Go "Invalid zip target name" / "Invalid file/dir to
     /// compress").
     Notify { title: &'static str, content: String },
-    /// R6: the target exists — add the process, finish it Cancelled.
+    /// Revised R6: `unique_target` exhausted its counter and the target
+    /// still exists — add the process, finish it Cancelled.
     AlreadyExists { target: PathBuf, total: usize },
 }
 
@@ -1896,7 +1897,10 @@ fn plan_compress(location: &Path, sources: &[PathBuf]) -> CompressPlan {
             }
         }
     };
-    let target = location.join(&zip_name);
+    // Revised R6 (Go `getZipArchiveName` -> `renameIfDuplicate`): a duplicate
+    // zip target renames to `name(N).zip`; Cancelled only on counter
+    // exhaustion (unique_target returns the input while it exists).
+    let target = fileops::unique_target(location.join(&zip_name));
     let total = match fileops::validate_compress_sources(sources) {
         Ok(t) => t,
         Err(err) => {
@@ -1907,6 +1911,7 @@ fn plan_compress(location: &Path, sources: &[PathBuf]) -> CompressPlan {
         }
     };
     if target.exists() {
+        // unique_target exhausted (Go renameIfDuplicate failure).
         return CompressPlan::AlreadyExists { target, total };
     }
     CompressPlan::Spawn { target, total }
@@ -2301,10 +2306,10 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_compress_duplicate_target_cancelled() {
-        // R6: an existing zip target is a Cancelled process
-        // ("File already exists"), not a rename — checked after validation,
-        // like Go zipSources' stat block.
+    fn test_plan_compress_duplicate_target_renames() {
+        // Revised R6 (Go `getZipArchiveName` -> `renameIfDuplicate`): a
+        // duplicate zip target renames to a(1).zip; the existing zip is
+        // untouched.
         let dir = std::env::temp_dir().join(format!("spf_compress_dup_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2312,14 +2317,25 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "x").unwrap();
 
         match plan_compress(&dir, &[dir.join("a.txt")]) {
-            CompressPlan::AlreadyExists { target, total } => {
-                assert_eq!(target, dir.join("a.zip"));
+            CompressPlan::Spawn { target, total } => {
+                assert_eq!(target, dir.join("a(1).zip"));
                 assert_eq!(total, 1);
             }
-            _ => panic!("duplicate target must plan AlreadyExists"),
+            _ => panic!("duplicate target must plan Spawn with renamed target"),
         }
-        // The existing zip is untouched.
         assert_eq!(std::fs::read_to_string(dir.join("a.zip")).unwrap(), "old");
+
+        // Exhaustion: unique_target resumes from (9999), hits the 10_000 cap
+        // and returns the input path while it exists -> Cancelled.
+        std::fs::write(dir.join("a(9999).txt"), "x").unwrap();
+        std::fs::write(dir.join("a(9999).zip"), "old").unwrap();
+        match plan_compress(&dir, &[dir.join("a(9999).txt")]) {
+            CompressPlan::AlreadyExists { target, total } => {
+                assert_eq!(target, dir.join("a(9999).zip"));
+                assert_eq!(total, 1);
+            }
+            _ => panic!("exhausted counter must plan AlreadyExists"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

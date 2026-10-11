@@ -26,8 +26,9 @@ Rust port of Go `superfile` v1.6.0 → binary `spf`. Orchestrator + 1 subagent (
   message, drops the record (R4). Full skip-resume success finishes Successful (R3).
 - Compress: Go `getZipArchiveName` naming (R10: `.gitignore` → `.gitignore.zip`), Go
   `validateCompressOperation` wording ("Invalid zip target name" / "Invalid file/dir to compress"),
-  duplicate target → process added then finished Cancelled "File already exists" (R6), explicit
-  target path to the worker (no internal rename).
+  duplicate target → renamed via `unique_target` to `name(N).zip` (revised R6, Go
+  `renameIfDuplicate` parity); Cancelled "File already exists" only when the counter exhausts;
+  explicit target path to the worker (no internal rename).
 - Extract: gate = last extension in {zip, bz, gz, iso, rar, 7z, tar} lowercase (R7 — `.xz`/`.tgz`/
   `.bz2` NOT extractable), output dir = strip ALL trailing dot-suffixes keeping leading dot (R8) +
   `unique_target`, created before the worker (Go `MkdirAll`).
@@ -40,10 +41,10 @@ Rust port of Go `superfile` v1.6.0 → binary `spf`. Orchestrator + 1 subagent (
 ## Go parity smoke (Task 3, scripted pty: `script` + stty 40x120, keys piped)
 Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
 - Compress fresh file: both create `notes.zip`, bar shows "Compressing notes.txt" → "Compressed notes.zip". ✅
-- Compress duplicate target: **DIVERGENCE** — Go v1.6.0 `getZipArchiveName` calls `renameIfDuplicate`
-  and creates `notes(1).zip`; the zipSources "File already exists" Cancelled block only fires on a
-  race. Rust follows the binding R6 ruling (Cancelled "File already exists", no rename). Flagged for
-  the planner: R6 matches the zipSources block but not Go's actual duplicate behavior.
+- Compress duplicate target: Go v1.6.0 `getZipArchiveName` calls `renameIfDuplicate` and creates
+  `notes(1).zip` (the zipSources "File already exists" Cancelled block only fires on a race).
+  **Fixed per revised R6 ruling**: Rust now renames via `unique_target` (`a.zip` → `a(1).zip`);
+  Cancelled "File already exists" remains only for counter exhaustion.
 - Extract `archive.tar`: both create dir `archive/`, bar shows "Extracting/Extracted archive.tar". ✅
 - Smoke found + fixed: `relayout` panicked (subtract overflow) on a 0x0 pty — now `saturating_sub`.
 
