@@ -402,7 +402,8 @@ impl App {
         let sidebar_w = self.config.sidebar_width as usize;
         self.sidebar.set_dimensions(sidebar_w + 2, self.main_panel_h + 2);
         let file_model_w = if sidebar_w > 0 {
-            self.full_w - (sidebar_w + 2)
+            // saturating: a 0-width terminal (odd pty) must not panic.
+            self.full_w.saturating_sub(sidebar_w + 2)
         } else {
             self.full_w
         };
