@@ -140,6 +140,10 @@ pub enum WorkerMsg {
 /// file count); same-device Cut uses the fast whole-tree rename with no
 /// per-file progress. Every op ends with a final `Progress { done: total }`
 /// (Go `process.Done = process.Total` before `markProcessDone`).
+///
+/// `total` is computed once by the caller (`op_total`) and shared with the
+/// process-bar entry; `use_trash` selects the trash backend for `Delete`
+/// (Go `makeDeleteProcessor`'s `deleteFunc` choice).
 pub fn spawn_worker(
     kind: OpKind,
     op_id: u64,
@@ -147,11 +151,9 @@ pub fn spawn_worker(
     dest: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
+    total: usize,
+    use_trash: bool,
 ) {
-    let total: usize = match kind {
-        OpKind::Copy | OpKind::Cut => items.iter().map(|p| count_files(p)).sum(),
-        _ => items.len(),
-    };
     std::thread::spawn(move || {
         fn progress_cb<'a>(
             tx: &'a Sender<WorkerMsg>,
@@ -188,7 +190,7 @@ pub fn spawn_worker(
                             .map_err(|e| e.to_string())
                     }
                 }
-                OpKind::Delete => delete_item(item, true).map_err(|e| e.to_string()).map(|_| done += 1),
+                OpKind::Delete => delete_item(item, use_trash).map_err(|e| e.to_string()).map(|_| done += 1),
                 OpKind::Create => create_item(item).map_err(|e| e.to_string()).map(|_| done += 1),
                 OpKind::Compress => compress_items(&[item.clone()], &dest).map(|_| done += 1).map_err(|e| e.to_string()),
                 OpKind::Extract => extract_archive(item).map(|_| done += 1).map_err(|e| e.to_string()),
@@ -229,6 +231,16 @@ pub fn spawn_worker(
     });
 }
 
+/// Process-bar total for an op (R2): paste totals are recursive file counts,
+/// other ops count items. Computed once by the app and passed to
+/// `spawn_worker` (also used when resuming after Skip).
+pub fn op_total(kind: OpKind, items: &[PathBuf]) -> usize {
+    match kind {
+        OpKind::Copy | OpKind::Cut => items.iter().map(|p| count_files(p)).sum(),
+        _ => items.len(),
+    }
+}
+
 /// Re-run a worker on the remaining items after the user pressed "Skip".
 #[allow(dead_code)] // wired by the skip/abort flow (Task 3)
 pub fn spawn_remaining(
@@ -238,9 +250,11 @@ pub fn spawn_remaining(
     dest: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
+    use_trash: bool,
 ) {
     let items: Vec<PathBuf> = remaining.iter().map(|s| PathBuf::from(s)).collect();
-    spawn_worker(kind, op_id, items, dest, cancel, tx);
+    let total = op_total(kind, &items);
+    spawn_worker(kind, op_id, items, dest, cancel, tx, total, use_trash);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,17 +330,31 @@ pub fn move_item(src: &Path, dest_dir: &Path, progress: Option<&mut dyn FnMut(&P
     }
 }
 
-/// Create a file or directory. A trailing `/` makes it a directory.
+/// Create a file or directory (Go `createItem`). A trailing `/` makes it a
+/// directory (`create_dir_all`, like Go's `MkdirAll`); a file path goes
+/// through `unique_target` (Go `renameIfDuplicate`, R1 `name(N).ext` format)
+/// before creating parents + file.
+///
+/// Go `checkFileNameValidity` rejects `.` / `..` and names ending in `/.` or
+/// `/..`; the worker receives the joined path, so the trailing `.`/`..`
+/// component carries the rejection.
 pub fn create_item(path: &Path) -> std::io::Result<()> {
     let s = path.display().to_string();
+    if s == "." || s == ".." || s.ends_with("/.") || s.ends_with("/..") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file name cannot be '.' or '..'",
+        ));
+    }
     if s.ends_with('/') {
         std::fs::create_dir_all(path)
     } else {
+        let path = unique_target(path.to_path_buf());
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(p) = parent {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path)
             .map(|_| ())
     }
 }
@@ -364,9 +392,30 @@ pub fn trash_root() -> Option<PathBuf> {
 }
 
 /// True when the trash is available (drives the confirmation wording).
-#[allow(dead_code)] // used by the delete confirmation flow (Task 2)
 pub fn has_trash() -> bool {
     trash_root().is_some()
+}
+
+/// Approximation of Go `trash.Available` + `selectTrashDir`: the trash root
+/// exists, `path` is not inside a known trash dir (Go `isInsideKnownTrash`,
+/// home-trash variant), and `path` shares the trash root's device (`st_dev`,
+/// Go `sameDevice`). Cross-device paths would need a per-mount `.Trash-uid`
+/// (Go's fallback), which this port does not create — reported unavailable
+/// so the delete flow falls back to permanent deletion.
+pub fn trash_available_for(path: &Path) -> bool {
+    let root = match trash_root() {
+        Some(r) => r,
+        None => return false,
+    };
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root_abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    if abs.starts_with(&root_abs) {
+        return false;
+    }
+    match (std::fs::metadata(&abs), std::fs::metadata(&root_abs)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
 }
 
 pub fn trash_move(src: &Path) -> std::io::Result<()> {
@@ -634,14 +683,17 @@ pub fn unique_target(p: PathBuf) -> PathBuf {
     let stem = &name[..name.len() - ext.len()];
     // Go suffixRegexp `^(.*)\((\d+)\)$` on the stem: resume from an existing (N).
     let mut base = stem.to_string();
-    let mut counter = 1u32;
+    // Go parses the counter as int64; u64 + saturating keeps a huge existing
+    // `(N)` suffix behaving like Go (counter past the 10_000 cap -> no free
+    // name -> the original path is returned and the fs call fails).
+    let mut counter: u64 = 1;
     if let Some(inner) = stem.strip_suffix(')') {
         if let Some(pos) = inner.rfind('(') {
             let digits = &inner[pos + 1..];
             if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
                 base = inner[..pos].to_string();
-                if let Ok(n) = digits.parse::<u32>() {
-                    counter = n + 1;
+                if let Ok(n) = digits.parse::<u64>() {
+                    counter = n.saturating_add(1);
                 }
             }
         }
@@ -924,6 +976,8 @@ mod tests {
             dest.clone(),
             Arc::new(AtomicBool::new(false)),
             tx,
+            op_total(OpKind::Copy, &[src_root.join("tree")]),
+            false,
         );
         let msgs = collect_worker_msgs(rx);
 
@@ -968,6 +1022,8 @@ mod tests {
             dest.clone(),
             Arc::new(AtomicBool::new(false)),
             tx,
+            2,
+            false,
         );
         let msgs = collect_worker_msgs(rx);
 
@@ -988,5 +1044,106 @@ mod tests {
         assert!(dest.join("src/a.txt").exists());
         assert!(dest.join("src/b.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worker_delete_permanent_fallback() {
+        // use_trash = false: Go `makeDeleteProcessor` with `deleteFunc =
+        // os.RemoveAll` — permanent deletion, no trash involvement.
+        let root = temp_dir("worker_delete");
+        touch(&root, "gone.txt");
+        touch(&root, "tree/inner.txt");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(
+            OpKind::Delete,
+            3,
+            vec![root.join("gone.txt"), root.join("tree")],
+            root.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            2,
+            false,
+        );
+        let msgs = collect_worker_msgs(rx);
+
+        // Delete totals count items (R2), one Progress per deleted item.
+        let dones: Vec<usize> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                WorkerMsg::Progress { done, total, .. } => {
+                    assert_eq!(*total, 2);
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones, vec![1, 2, 2]);
+        assert!(matches!(msgs.last(), Some(WorkerMsg::Done { op: 3 })));
+
+        assert!(!root.join("gone.txt").exists());
+        assert!(!root.join("tree").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- trash_available_for (Go trash.Available approximation) ----------
+
+    #[test]
+    fn trash_available_for_cross_device_false() {
+        // /proc is procfs: a different st_dev than the XDG trash root (and
+        // Go's per-mount .Trash-uid fallback is not implemented here).
+        assert!(!trash_available_for(Path::new("/proc")));
+        if let Some(root) = trash_root() {
+            // Inside a known trash dir -> false (Go isInsideKnownTrash).
+            assert!(!trash_available_for(&root));
+            assert!(!trash_available_for(&root.join("files")));
+        }
+    }
+
+    // ---- create_item (Go createItem + checkFileNameValidity) -------------
+
+    #[test]
+    fn create_item_rejects_dot_names() {
+        let dir = temp_dir("create_dot");
+        for name in [".", "..", "sub/.", "sub/.."] {
+            let err = create_item(&dir.join(name)).unwrap_err().to_string();
+            assert!(
+                err.contains("file name cannot be '.' or '..'"),
+                "{name}: {err}"
+            );
+        }
+        // Nothing was created.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(!dir.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_item_duplicate_uses_go_format() {
+        let dir = temp_dir("create_dup");
+        create_item(&dir.join("a.txt")).unwrap();
+        create_item(&dir.join("a.txt")).unwrap(); // renameIfDuplicate -> a(1).txt
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("a(1).txt").exists());
+
+        // Directory creation (trailing slash): MkdirAll, no dedup.
+        create_item(&dir.join("newdir/")).unwrap();
+        assert!(dir.join("newdir").is_dir());
+        // Nested parents are created (Go MkdirAll(filepath.Dir(path))).
+        create_item(&dir.join("x/y/file.txt")).unwrap();
+        assert!(dir.join("x/y/file.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_target_huge_counter_like_go() {
+        // T1-m3: Go parses the (N) suffix as int64. A counter beyond the
+        // 10_000 cap means no free name -> Go errors; here the original path
+        // is returned so the subsequent fs call fails (same op outcome).
+        let dir = temp_dir("unique_huge");
+        touch(&dir, "a(4294967296).txt"); // beyond u32, within u64
+        let p = dir.join("a(4294967296).txt");
+        assert_eq!(unique_target(p.clone()), p);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

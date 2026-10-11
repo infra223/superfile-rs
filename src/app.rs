@@ -74,6 +74,12 @@ const CURRENT_VERSION: &str = "v1.6.0"; // Go variable.CurrentVersion
 const LATEST_VERSION_URL: &str = "https://api.github.com/repos/yorukot/superfile/releases/latest";
 const LATEST_VERSION_GH: &str = "https://github.com/yorukot/superfile/releases";
 
+// Go common/predefined_variable.go delete-warning strings.
+const TRASH_WARN_TITLE: &str = "Are you sure you want to move this to trash can";
+const TRASH_WARN_CONTENT: &str = "This operation will move file or directory to trash can.";
+const PERM_DELETE_WARN_TITLE: &str = "Are you sure you want to completely delete";
+const PERM_DELETE_WARN_CONTENT: &str = "This operation cannot be undone and your data will be completely lost.";
+
 /// Which non-file-panel region is focused. File-panel focus = Focus::None
 /// (the active panel is group.focused_idx()).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -586,9 +592,16 @@ impl App {
             match self.typing_modal.handle_key(k, &self.hotkeys) {
                 dialogs::TypingAction::Cancel => {} // component already closed
                 dialogs::TypingAction::Confirm => {
-                    let _value = self.typing_modal.value().to_string();
+                    // Go getCreateCmd: close the modal, then run the create
+                    // op on the typed name (validation failures surface via
+                    // the worker Fail -> OpFail -> spf-error modal).
+                    let value = self.typing_modal.value().to_string();
+                    let location = PathBuf::from(self.typing_modal.location());
                     self.typing_modal.close();
-                    // TODO(task-B): spawn create op with the typed name
+                    if value.is_empty() {
+                        return;
+                    }
+                    self.spawn_op(OpKind::Create, vec![location.join(&value)], location, false);
                 }
                 dialogs::TypingAction::None => {}
             }
@@ -636,9 +649,8 @@ impl App {
                         self.quit_state = QuitState::ConfirmReceived;
                         self.quit_cd_on_quit = cd_on_quit;
                     }
-                    ConfirmAction::Delete | ConfirmAction::PermanentDelete => {
-                        // TODO(task-B): spawn delete op (soft / permanent)
-                    }
+                    ConfirmAction::Delete => self.spawn_delete_op(true),
+                    ConfirmAction::PermanentDelete => self.spawn_delete_op(false),
                     ConfirmAction::NoAction => {}
                 },
             }
@@ -941,10 +953,10 @@ impl App {
                 self.group.focused_panel_mut().item_select_down();
             }
             if keys::matches_any(&self.hotkeys.delete_items, k) {
-                // TODO(task-B)
+                self.delete_trigger(false);
             }
             if keys::matches_any(&self.hotkeys.permanently_delete_items, k) {
-                // TODO(task-B)
+                self.delete_trigger(true);
             }
             if keys::matches_any(&self.hotkeys.copy_items, k) {
                 self.copy_multiple_items(false);
@@ -970,11 +982,11 @@ impl App {
             return;
         }
         if keys::matches_any(&self.hotkeys.delete_items, k) {
-            // TODO(task-B)
+            self.delete_trigger(false);
             return;
         }
         if keys::matches_any(&self.hotkeys.permanently_delete_items, k) {
-            // TODO(task-B)
+            self.delete_trigger(true);
             return;
         }
         if keys::matches_any(&self.hotkeys.copy_items, k) {
@@ -1376,13 +1388,48 @@ impl App {
             self.notify.open("Invalid paste location".to_string(), err, ConfirmAction::NoAction);
             return;
         }
-        self.spawn_op(if cut { OpKind::Cut } else { OpKind::Copy }, items, dest);
+        self.spawn_op(if cut { OpKind::Cut } else { OpKind::Copy }, items, dest, false);
+    }
+
+    /// Go `getDeleteTriggerCmd`: guard the panel state, then open the notify
+    /// modal with the trash or permanent-delete warning.
+    fn delete_trigger(&mut self, perm: bool) {
+        let panel = self.group.focused_panel();
+        if (panel.mode == crate::panel::PanelMode::Select && panel.selected_count() == 0)
+            || (panel.mode == crate::panel::PanelMode::Browser && panel.empty())
+        {
+            return;
+        }
+        let trash_ok = fileops::has_trash() && fileops::trash_available_for(&panel.location);
+        let (title, content, action) = delete_confirm(perm, trash_ok);
+        self.notify.open(title.to_string(), content.to_string(), action);
+    }
+
+    /// Go `getDeleteCmd` (run after the notify confirm): collect the items
+    /// (select mode: selected, visible order; browser mode: focused item)
+    /// and spawn the delete op. `allow_trash` is the confirmed action —
+    /// `Delete` (trash warning) or `PermanentDelete`.
+    fn spawn_delete_op(&mut self, allow_trash: bool) {
+        let panel = self.group.focused_panel();
+        if panel.empty() {
+            return;
+        }
+        let items: Vec<PathBuf> = if panel.mode == crate::panel::PanelMode::Select {
+            panel.selected_paths()
+        } else {
+            panel.cursor_entry().map(|e| vec![e.path.clone()]).unwrap_or_default()
+        };
+        let location = panel.location.clone();
+        let use_trash = allow_trash && fileops::has_trash() && fileops::trash_available_for(&location);
+        // Go: dest is unused by the delete processor; the panel location is
+        // kept for the OpRecord.
+        self.spawn_op(OpKind::Delete, items, location, use_trash);
     }
 
     /// Go executePasteOperation et al. — register the process-bar entry,
     /// spawn the worker, and bridge its `WorkerMsg`s to the UI as `AsyncMsg`s
     /// (`Progress -> OpProgress`, `Fail -> OpFail`, `Done -> OpDone`).
-    fn spawn_op(&mut self, kind: OpKind, items: Vec<PathBuf>, dest: PathBuf) {
+    fn spawn_op(&mut self, kind: OpKind, items: Vec<PathBuf>, dest: PathBuf, use_trash: bool) {
         if items.is_empty() {
             return;
         }
@@ -1390,17 +1437,15 @@ impl App {
         let op_id = self.io_req;
         let cancel = Arc::new(AtomicBool::new(false));
         // R2: paste totals are recursive file counts; other ops count items.
-        let total: usize = match kind {
-            OpKind::Copy | OpKind::Cut => items.iter().map(|p| fileops::count_files(p)).sum(),
-            _ => items.len(),
-        };
+        // Computed once here and shared with the worker (process-bar entry).
+        let total = fileops::op_total(kind, &items);
         let name = items[0]
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| items[0].display().to_string());
 
         let (wtx, wrx) = mpsc::channel::<WorkerMsg>();
-        fileops::spawn_worker(kind, op_id, items, dest.clone(), cancel.clone(), wtx);
+        fileops::spawn_worker(kind, op_id, items, dest.clone(), cancel.clone(), wtx, total, use_trash);
         let utx = self.tx.clone();
         let cancel_flag = cancel.clone();
         std::thread::spawn(move || {
@@ -1452,7 +1497,8 @@ impl App {
                 let state = if cancelled { State::Cancelled } else { State::Successful };
                 self.processbar.finish(op, state, None);
                 if let Some(rec) = self.ops.remove(&op) {
-                    apply_paste_effects(&mut self.clipboard_ui, rec.kind, state);
+                    let panel = self.group.focused_panel_mut();
+                    apply_op_effects(&mut self.clipboard_ui, rec.kind, state, panel);
                 }
                 // R9: refresh every panel so pasted/moved entries show up.
                 for p in self.group.panels_mut() {
@@ -1695,6 +1741,36 @@ fn apply_paste_effects(clipboard: &mut Clipboard, kind: OpKind, state: State) {
     }
 }
 
+/// Go `getDeleteTriggerCmd` wording selection: trash warning when the trash
+/// is usable and the hotkey was not the permanent-delete one, else the
+/// permanent warning.
+fn delete_confirm(perm: bool, trash_ok: bool) -> (&'static str, &'static str, ConfirmAction) {
+    if trash_ok && !perm {
+        (TRASH_WARN_TITLE, TRASH_WARN_CONTENT, ConfirmAction::Delete)
+    } else {
+        (
+            PERM_DELETE_WARN_TITLE,
+            PERM_DELETE_WARN_CONTENT,
+            ConfirmAction::PermanentDelete,
+        )
+    }
+}
+
+/// Post-completion effects of an op (Go `*OperationMsg.ApplyToModel`):
+/// paste ops update the clipboard; a delete op clears the focused panel's
+/// selection (`DeleteOperationMsg`: ResetSelected on every state).
+fn apply_op_effects(
+    clipboard: &mut Clipboard,
+    kind: OpKind,
+    state: State,
+    panel: &mut crate::panel::FilePanel,
+) {
+    apply_paste_effects(clipboard, kind, state);
+    if kind == OpKind::Delete {
+        panel.reset_selected();
+    }
+}
+
 /// Go setHeightValues footer logic.
 fn footer_height(full_h: usize, toggle: bool) -> usize {
     if !toggle {
@@ -1927,5 +2003,65 @@ mod tests {
         clipboard.add("/tmp/x");
         apply_paste_effects(&mut clipboard, OpKind::Delete, State::Successful);
         assert!(clipboard.is_cut());
+    }
+
+    #[test]
+    fn test_delete_confirm_wording() {
+        // Go getDeleteTriggerCmd: trash warning when the trash is usable and
+        // the hotkey was not the permanent one.
+        let (title, content, action) = delete_confirm(false, true);
+        assert_eq!(title, "Are you sure you want to move this to trash can");
+        assert_eq!(content, "This operation will move file or directory to trash can.");
+        assert_eq!(action, ConfirmAction::Delete);
+
+        // Permanent hotkey or no usable trash -> permanent warning.
+        for (perm, trash_ok) in [(true, true), (false, false), (true, false)] {
+            let (title, content, action) = delete_confirm(perm, trash_ok);
+            assert_eq!(title, "Are you sure you want to completely delete");
+            assert_eq!(
+                content,
+                "This operation cannot be undone and your data will be completely lost."
+            );
+            assert_eq!(action, ConfirmAction::PermanentDelete);
+        }
+    }
+
+    #[test]
+    fn test_apply_op_effects_delete_resets_selection() {
+        // Go DeleteOperationMsg.ApplyToModel: a delete op (any state) clears
+        // the focused panel's selection; other ops do not.
+        use crate::fileops::Entry;
+        use crate::panel::{FilePanel, PanelMode};
+        let mut panel = FilePanel::new(PathBuf::from("/tmp"), &Config::default());
+        panel.entries = vec![Entry {
+            name: "a.txt".into(),
+            path: PathBuf::from("/tmp/a.txt"),
+            is_dir: false,
+            is_symlink: false,
+            size: 1,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            mode: 0o100644,
+        }];
+        panel.mode = PanelMode::Select;
+        panel.selected = vec![PathBuf::from("/tmp/a.txt")];
+
+        let mut clipboard = Clipboard::new();
+        clipboard.reset(true);
+        clipboard.add("/tmp/a.txt");
+
+        apply_op_effects(&mut clipboard, OpKind::Delete, State::Successful, &mut panel);
+        assert_eq!(panel.selected_count(), 0);
+        // Delete ops leave the clipboard alone.
+        assert!(clipboard.is_cut());
+        assert_eq!(clipboard.items(), vec!["/tmp/a.txt".to_string()]);
+
+        panel.selected = vec![PathBuf::from("/tmp/a.txt")];
+        apply_op_effects(&mut clipboard, OpKind::Delete, State::Cancelled, &mut panel);
+        assert_eq!(panel.selected_count(), 0);
+
+        // A copy op does not clear the selection.
+        panel.selected = vec![PathBuf::from("/tmp/a.txt")];
+        apply_op_effects(&mut clipboard, OpKind::Copy, State::Successful, &mut panel);
+        assert_eq!(panel.selected_count(), 1);
     }
 }
