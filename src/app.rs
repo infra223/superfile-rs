@@ -1809,6 +1809,10 @@ impl App {
                 let path = item.path.clone();
                 self.io_req += 1;
                 self.preview.open_at(path, self.io_req);
+                // Go ToggleFilePreviewPanel: updateChildComponentWidth right
+                // after the open state flips, so the panel widths and the
+                // preview width used below are fresh.
+                self.relayout();
             } else {
                 return;
             }
