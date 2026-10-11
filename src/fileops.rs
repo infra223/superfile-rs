@@ -312,7 +312,7 @@ pub fn copy_item(src: &Path, dest_dir: &Path, progress: Option<&mut dyn FnMut(&P
         None => &mut sink,
     };
     let name = src.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
-    let target = unique_target(dest_dir.join(name));
+    let target = free_target(dest_dir.join(name))?;
     let lmeta = std::fs::symlink_metadata(src)?;
     if lmeta.file_type().is_symlink() {
         let link = std::fs::read_link(src)?;
@@ -359,7 +359,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path, mut progress: &mut dyn FnMut(&Path
 /// copy+remove path only (the rename fast path has no per-file progress).
 pub fn move_item(src: &Path, dest_dir: &Path, progress: Option<&mut dyn FnMut(&Path)>) -> std::io::Result<()> {
     let name = src.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
-    let target = unique_target(dest_dir.join(name));
+    let target = free_target(dest_dir.join(name))?;
     if std::fs::rename(src, &target).is_ok() {
         return Ok(());
     }
@@ -390,16 +390,10 @@ pub fn create_item(path: &Path) -> std::io::Result<()> {
     if s.ends_with('/') {
         std::fs::create_dir_all(path)
     } else {
-        let deduped = unique_target(path.to_path_buf());
-        if deduped == path && path.exists() {
-            // unique_target exhausted its 10_000 counter and returned the
-            // existing path: Go `renameIfDuplicate` errors here; opening it
-            // with truncate(true) would silently wipe the existing file.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("could not find free name for {} after many attempts", path.display()),
-            ));
-        }
+        // unique_target exhausted its 10_000 counter and returned the
+        // existing path: Go `renameIfDuplicate` errors here; opening it
+        // with truncate(true) would silently wipe the existing file.
+        let deduped = free_target(path.to_path_buf())?;
         let parent = deduped.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(p) = parent {
             std::fs::create_dir_all(p)?;
@@ -485,8 +479,8 @@ pub fn trash_move(src: &Path) -> std::io::Result<()> {
 
     let abs = std::fs::canonicalize(src)?;
     let name = abs.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no name"))?;
-    let target = unique_target(files.join(name));
-    let info_target = unique_target(info.join(format!(".{:?}.trashinfo", name.to_string_lossy()).trim_matches('"')));
+    let target = free_target(files.join(name))?;
+    let info_target = free_target(info.join(format!(".{:?}.trashinfo", name.to_string_lossy()).trim_matches('"')))?;
 
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let content = format!(
@@ -801,7 +795,7 @@ fn run_external_extract(tool: &str, path: &Path, dest: &Path) -> std::io::Result
 /// `dir/name(2).ext`, ... resuming the counter from an existing `(N)` suffix
 /// (cap 10_000). On exhaustion returns the original path unchanged; callers
 /// must treat "unchanged + exists" as exhaustion (Go returns an error there)
-/// — `create_item` does, so it never truncates an existing file.
+/// — `free_target` wraps that guard and every fs call site uses it.
 pub fn unique_target(p: PathBuf) -> PathBuf {
     if !p.exists() {
         return p;
@@ -837,6 +831,21 @@ pub fn unique_target(p: PathBuf) -> PathBuf {
         }
     }
     p
+}
+
+/// `unique_target` plus the Go `renameIfDuplicate` exhaustion guard: when the
+/// 10_000 counter is spent the helper returns the original path unchanged, and
+/// every caller must error ("could not find free name") instead of letting
+/// `copy`/`rename`/`truncate` silently replace the existing target.
+fn free_target(p: PathBuf) -> std::io::Result<PathBuf> {
+    let deduped = unique_target(p.clone());
+    if deduped == p && p.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not find free name for {} after many attempts", p.display()),
+        ));
+    }
+    Ok(deduped)
 }
 
 /// Go `countFiles`: recursive count of non-directory entries (symlinks count
@@ -1342,6 +1351,68 @@ mod tests {
         // Existing contents untouched.
         assert_eq!(std::fs::read_to_string(&at_cap).unwrap(), "keep");
         assert_eq!(std::fs::read_to_string(&huge).unwrap(), "keep2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- unique_target exhaustion guard (free_target) on fs call sites ----
+
+    #[test]
+    fn copy_item_exhausted_counter_errors_without_overwriting() {
+        // Review fix 2: at the 10_000 cap unique_target returns the existing
+        // target unchanged; copy_item must error (Go renameIfDuplicate)
+        // instead of std::fs::copy replacing the existing file.
+        let dir = temp_dir("copy_exhaust");
+        let dest = dir.join("dest");
+        let target = touch(&dest, "a(9999).txt"); // counter 10_000 -> range empty
+        std::fs::write(&target, "keep").unwrap();
+        let src = touch(&dir, "src/a(9999).txt");
+
+        let err = copy_item(&src, &dest, None).unwrap_err().to_string();
+        assert!(err.contains("could not find free name"), "{err}");
+        assert!(src.exists(), "source must survive a refused copy");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_item_exhausted_counter_errors_without_overwriting() {
+        // rename() would silently replace the existing target at exhaustion.
+        let dir = temp_dir("move_exhaust");
+        let dest = dir.join("dest");
+        let target = touch(&dest, "a(9999).txt");
+        std::fs::write(&target, "keep").unwrap();
+        let src = touch(&dir, "src/a(9999).txt");
+
+        let err = move_item(&src, &dest, None).unwrap_err().to_string();
+        assert!(err.contains("could not find free name"), "{err}");
+        assert!(src.exists(), "source must survive a refused move");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trash_move_exhausted_counter_errors_without_overwriting() {
+        // The rename into Trash/files must not replace an existing trash entry.
+        let _guard = TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("trash_exhaust");
+        let trash = dir.join("Trash");
+        std::fs::create_dir_all(trash.join("files")).unwrap();
+        std::fs::create_dir_all(trash.join("info")).unwrap();
+        let target = touch(&trash.join("files"), "a(9999).txt");
+        std::fs::write(&target, "keep").unwrap();
+        let src = touch(&dir, "src/a(9999).txt");
+
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let result = trash_move(&src);
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("could not find free name"), "{err}");
+        assert!(src.exists(), "source must survive a refused trash move");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
