@@ -60,7 +60,7 @@ use crate::fileops::{self, OpKind, WorkerMsg};
 use crate::icons::{self, Ui};
 use crate::keys::{self, Key};
 use crate::metadata;
-use crate::panel::SortKind;
+use crate::panel::{PanelMode, SortKind};
 use crate::panels::PanelGroup;
 use crate::preview;
 use crate::processbar::{Operation, ProcessBar, State};
@@ -1244,12 +1244,34 @@ impl App {
         }
     }
 
+    /// Go: copyPathText — empty panel -> ""; Select mode with selections ->
+    /// selected locations joined with "\n" in visible order; otherwise the
+    /// focused item.
+    fn copy_path_text(&self) -> String {
+        let panel = self.group.focused_panel();
+        if panel.empty() {
+            return String::new();
+        }
+        if panel.mode == PanelMode::Select && panel.selected_count() > 0 {
+            return panel
+                .selected_paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        panel
+            .cursor_entry()
+            .map(|e| e.path.display().to_string())
+            .unwrap_or_default()
+    }
+
     fn copy_path(&mut self) {
-        let Some(item) = self.group.focused_panel().cursor_entry() else {
-            return;
-        };
-        let _ = arboard::Clipboard::new()
-            .and_then(|mut c| c.set_text(&item.path.display().to_string()));
+        let text = self.copy_path_text();
+        if text.is_empty() {
+            return; // Go: copyPath early-return on empty text
+        }
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(&text));
     }
 
     fn toggle_preview(&mut self) {
@@ -2221,6 +2243,90 @@ mod tests {
         assert_eq!(app.metadata.get_location(), expected.display().to_string());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build an App on a temp dir containing exactly 3 files, with the focused
+    /// panel populated through the real async listing path.
+    fn copy_app_fixture(tag: &str) -> (App, PathBuf) {
+        let base = std::env::temp_dir().join(format!("spf_cp_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("files");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        let paths = Paths {
+            config_dir: base.join("config"),
+            state_dir: base.join("state"),
+            data_dir: base.join("data"),
+            config_file: None,
+            hotkey_file: None,
+        };
+        let mut app = App::new(paths, vec![dir.clone()], false, None);
+
+        app.relist_panels();
+        for _ in 0..50 {
+            if let Ok(msg) = app.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                app.handle_async(msg);
+            }
+            if app.group.focused_panel().entries.len() >= 3 {
+                break;
+            }
+        }
+        assert!(
+            app.group.focused_panel().cursor_entry().is_some(),
+            "DirListed did not arrive"
+        );
+        (app, base)
+    }
+
+    #[test]
+    fn test_copy_path_text_select_mode_joins_selected() {
+        // Go copyPathText: Select mode with selections -> selected locations
+        // joined with "\n" in visible order.
+        let (mut app, base) = copy_app_fixture("sel");
+        let (first, third) = {
+            let panel = app.group.focused_panel();
+            (panel.entries[0].path.clone(), panel.entries[2].path.clone())
+        };
+        {
+            let panel = app.group.focused_panel_mut();
+            panel.mode = PanelMode::Select;
+            panel.toggle_selected(&first);
+            panel.toggle_selected(&third);
+        }
+        let expected = format!("{}\n{}", first.display(), third.display());
+        assert_eq!(app.copy_path_text(), expected);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_copy_path_text_select_mode_empty_uses_cursor() {
+        // Go copyPathText: Select mode with no selection -> focused item only.
+        let (mut app, base) = copy_app_fixture("sel_empty");
+        app.group.focused_panel_mut().mode = PanelMode::Select;
+        let focused = app.group.focused_panel().cursor_entry().unwrap().path.clone();
+        assert_eq!(app.copy_path_text(), focused.display().to_string());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_copy_path_text_browser_mode_uses_cursor() {
+        // Go copyPathText ignores selections outside Select mode: stale selected
+        // entries in Browser mode still copy only the focused item.
+        let (mut app, base) = copy_app_fixture("browser");
+        let (first, second) = {
+            let panel = app.group.focused_panel();
+            (panel.entries[0].path.clone(), panel.entries[1].path.clone())
+        };
+        {
+            let panel = app.group.focused_panel_mut();
+            panel.toggle_selected(&first);
+            panel.toggle_selected(&second);
+        }
+        let focused = app.group.focused_panel().cursor_entry().unwrap().path.clone();
+        assert_eq!(app.copy_path_text(), focused.display().to_string());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
