@@ -122,3 +122,6 @@ Deviations/notes recorded by review:
 - Deferred minors (next touch of the file): browser-mode copy test cursor/selection
   collision + empty-panel test (with R-C12 task); glyph test row-2 (divider) assertion;
   PanelMode import style in app.rs.
+- Verified parity (do not "fix"): select-mode footer text collapse to icons-only in narrow
+  panels is Go's AreInfoItemsTruncated fallback (filepanel/render.go:64-66); Rust output is
+  byte-identical to Go at both narrow and wide panel widths (2026-10-13 pty repro).
