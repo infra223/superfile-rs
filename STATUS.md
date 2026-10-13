@@ -12,8 +12,8 @@ Rust port of Go `superfile` v1.6.0 → binary `spf`. Orchestrator + 1 subagent (
 | metadata.rs | ✅ done + verified (1161 lines, 9 tests) |
 | dialogs.rs | ✅ done + verified (2076 lines, 18 tests; notify/spferror/sort/theme/help/typing + first-use) |
 | panels.rs | ✅ done + verified (1097 lines, 17 tests; PanelGroup + full panel render) |
-| fileops.rs | ✅ TASK B done + verified (1688 lines, 28 tests; paste/compress/extract/delete/create workers, Go naming + totals) |
-| app.rs | ✅ TASK A + TASK B done + verified (2481 lines, 12 tests; core state/event loop/layout/render/dispatch/preview/metadata/zoxide/prompt/quit/updates + all file-op triggers + spf-error skip/abort) |
+| fileops.rs | ✅ TASK B + TASK C done + verified (30 tests; paste/compress/extract/delete/create workers, Go naming + totals, XDG Trash layout init) |
+| app.rs | ✅ TASK A + TASK B + TASK C done + verified (15 tests; core state/event loop/layout/render/dispatch/preview/metadata/zoxide/prompt/quit/updates + all file-op triggers + spf-error skip/abort + copy_path select mode) |
 | **TESTS** | ✅ **170/170 passing** |
 
 ## TASK B complete (file ops)
@@ -66,8 +66,9 @@ Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
 ## Verification gate (per delivery)
 - `~/.cargo/bin/cargo check 2>&1 | grep src/<file>.rs` → empty (app/fileops/processbar clean)
 - `~/.cargo/bin/cargo check --tests 2>&1 | grep src/<file>.rs` → empty
-- `~/.cargo/bin/cargo test` → 177/177 green (174 at TASK B delivery + 3 post-merge fix tests)
-- Remaining 29 warnings (`cargo check`) / 22 (`cargo check --tests`) = pre-existing dead-code
+- `~/.cargo/bin/cargo test` → 184/184 green (174 at TASK B delivery + 3 post-merge fix tests + 7 TASK C tests)
+- Remaining 29 warnings (`cargo check`) / 21 (`cargo check --tests`) = pre-existing dead-code
+  (`check --tests` dropped 22→21 at TASK C: `Config::border_set()` is no longer dead code)
   for other features (Metadata/Md5/SubstDone/UpdateCheck variants, req_id fields, unused
   util/sidebar helpers). All Task-B APIs are consumed;
   `TODO(task-B)` markers: 0.
@@ -92,3 +93,32 @@ Ran `target/debug/spf` vs `/usr/bin/spf` (Go v1.6.0) in scratch dirs:
    direct dep. Note: installed /usr/bin/spf v1.6.0 predates repo HEAD b2af9a6, so its
    directory `Size` shows the inode stat while Rust correctly shows Go HEAD's `(focus)`
    behavior (real dir size when the metadata pane is focused).
+
+## TASK C complete (parity fixes from the 2026-10-13 feature-parity audit)
+
+Plan: docs/plans/task-c-parity-fixes.md. SDD execution (3 tasks, one subagent at a time,
+task review clean first pass each; final whole-branch review: ready to merge, no Critical).
+
+1. fileops.rs + main.rs: XDG Trash layout (`Trash/files`, `Trash/info`) created at startup
+   (Go `trash.Init()`/`ensureTrashLayout` parity); non-fatal on failure; base-injected
+   `trash_base`/`trash_root_in` helpers keep tests env-free. 17713fc.
+2. app.rs: `copy_path` honors select mode — new `copy_path_text` mirrors Go `copyPathText`
+   (Select mode + selections → all selected paths joined "\n" visible order; else focused;
+   empty → clipboard untouched). 084f800.
+3. All renderers honor the 10 `border_*` config glyphs — `Config::border_set()` (was dead
+   code) threaded as `set: BorderSet<'_>` into every component draw + dialogs helpers;
+   zero production `BorderSet::plain()` remain. 8b382c1.
+
+Deviations/notes recorded by review:
+- R-C11 (accepted, copy_path only): Select mode with selections but none visible → Rust
+  copies the cursor path (`selected_paths()` fallback); Go copies nothing. Escalated:
+  R-C12 — the same fallback in `spawn_delete_op`/`copy_multiple_items`/`compress_trigger`
+  is pre-existing and destructive-vs-no-op in Go; next parity task = drop the fallback in
+  the panel helper + explicit cursor fallbacks where Go has them + 4 tests.
+- R-C13 (closed, parity-correct): `--debug-info`/path-list skip trash seeding — Go also
+  returns before model construction/InitTrash (cmd/main.go:139-141).
+- R-C14 (closed, parity-correct): sidebar.rs hardcoded `─` divider label matches Go
+  (predefined_variable.go:130 hardcodes the glyph, colour-only styling). Do not "fix".
+- Deferred minors (next touch of the file): browser-mode copy test cursor/selection
+  collision + empty-panel test (with R-C12 task); glyph test row-2 (divider) assertion;
+  PanelMode import style in app.rs.
