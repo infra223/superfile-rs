@@ -424,17 +424,44 @@ pub fn delete_item(path: &Path, use_trash: bool) -> std::io::Result<()> {
 // XDG trash (Linux)
 // ---------------------------------------------------------------------------
 
-pub fn trash_root() -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
+/// Base directory for the trash: `$XDG_DATA_HOME` when absolute, else
+/// `dirs::data_dir()` (same resolution as the previous `trash_root`).
+pub fn trash_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| dirs::data_dir());
-    let data = data?;
-    let trash = data.join("Trash");
+        .or_else(|| dirs::data_dir())
+}
+
+/// The trash root under `base` (`base/Trash`) when it exists as a directory.
+pub fn trash_root_in(base: &Path) -> Option<PathBuf> {
+    let trash = base.join("Trash");
     if trash.is_dir() {
         Some(trash)
     } else {
         None
+    }
+}
+
+pub fn trash_root() -> Option<PathBuf> {
+    trash_base().and_then(|b| trash_root_in(&b))
+}
+
+/// Go `trash.ensureTrashLayout`: create `base/Trash/files` and
+/// `base/Trash/info` so the XDG trash layout exists before first use.
+pub fn ensure_trash_layout_in(base: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(base.join("Trash/files"))?;
+    std::fs::create_dir_all(base.join("Trash/info"))?;
+    Ok(())
+}
+
+/// Go `InitTrash`: seed the home trash layout at startup. Errors are logged
+/// with `eprintln!` and never fatal (Go logs and continues).
+pub fn ensure_trash_layout() {
+    if let Some(b) = trash_base() {
+        if let Err(e) = ensure_trash_layout_in(&b) {
+            eprintln!("Error initializing trash directory: {e}");
+        }
     }
 }
 
@@ -1282,6 +1309,29 @@ mod tests {
         assert!(ok, "same-device path must be trash-available");
         assert!(!inside);
         assert!(!cross);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- ensure_trash_layout (Go trash.Init / ensureTrashLayout) ---------
+
+    #[test]
+    fn test_ensure_trash_layout_creates_dirs() {
+        let base = std::env::temp_dir().join(format!("spf_trash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        ensure_trash_layout_in(&base).unwrap();
+        assert!(base.join("Trash/files").is_dir());
+        assert!(base.join("Trash/info").is_dir());
+        assert_eq!(trash_root_in(&base), Some(base.join("Trash")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_trash_root_in_missing_is_none() {
+        let base = std::env::temp_dir().join(format!("spf_trash_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(trash_root_in(&base), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 

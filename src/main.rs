@@ -307,6 +307,9 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Go `trash.Init()` parity: seed the XDG Trash layout (non-fatal).
+    fileops::ensure_trash_layout();
+
     if cli.fix_config_file || cli.fix_hotkeys {
         if let Err(e) = paths.fix_files() {
             eprintln!("Error fixing config files: {e}");
