@@ -427,6 +427,7 @@ impl App {
             return;
         }
         let sidebar_w = self.config.sidebar_width as usize;
+        let set = self.config.border_set();
         if sidebar_w > 0 {
             let loc = self.group.focused_panel().location.display().to_string();
             self.sidebar.draw(
@@ -440,6 +441,7 @@ impl App {
                 &self.pal,
                 &self.ui,
                 &self.hotkeys,
+                set,
             );
         }
         let fm_x = if sidebar_w > 0 { sidebar_w + 2 } else { 0 };
@@ -456,6 +458,7 @@ impl App {
                     false,
                     &self.pal,
                     &self.ui,
+                    set,
                 );
             }
         }
@@ -466,9 +469,9 @@ impl App {
             let w2 = self.full_w / 3;
             let w3 = self.full_w - w1 - w2;
             self.processbar
-                .draw(buf, 0, fy, w1, fh, self.focus == Focus::ProcessBar, &self.pal, self.ui);
-            self.metadata.draw(buf, w1, fy, w2, fh, self.focus == Focus::Metadata, &self.pal);
-            self.clipboard_ui.draw(buf, w1 + w2, fy, w3, fh, &self.pal, &self.ui);
+                .draw(buf, 0, fy, w1, fh, self.focus == Focus::ProcessBar, &self.pal, self.ui, set);
+            self.metadata.draw(buf, w1, fy, w2, fh, self.focus == Focus::Metadata, &self.pal, set);
+            self.clipboard_ui.draw(buf, w1 + w2, fy, w3, fh, &self.pal, &self.ui, set);
         }
         self.render_overlays(buf);
     }
@@ -479,45 +482,46 @@ impl App {
     fn render_overlays(&mut self, buf: &mut RBuf) {
         let cx = |w: usize| self.full_w / 2 - w / 2;
         let cy = |h: usize| self.full_h / 2 - h / 2;
+        let set = self.config.border_set();
         if self.spf_error.is_open() {
-            self.spf_error.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.hotkeys);
+            self.spf_error.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.hotkeys, set);
             return;
         }
         if self.help_menu.is_open() {
             let (w, h) = (self.help_menu.width(), self.help_menu.height());
-            self.help_menu.draw(buf, cx(w), cy(h), &self.pal, &self.ui, &self.hotkeys);
+            self.help_menu.draw(buf, cx(w), cy(h), &self.pal, &self.ui, &self.hotkeys, set);
             return;
         }
         if self.prompt.is_open() {
             let (w, h) = (self.prompt.width(), self.prompt.height());
-            self.prompt.draw(buf, cx(w), cy(h), w, h, true, &self.pal, &self.ui, &self.hotkeys);
+            self.prompt.draw(buf, cx(w), cy(h), w, h, true, &self.pal, &self.ui, &self.hotkeys, set);
             return;
         }
         if self.zoxide.is_open() {
             let (w, h) = (self.zoxide.width(), self.zoxide.height());
-            self.zoxide.draw(buf, cx(w), cy(h), w, h, true, &self.pal, &self.ui, &self.hotkeys);
+            self.zoxide.draw(buf, cx(w), cy(h), w, h, true, &self.pal, &self.ui, &self.hotkeys, set);
             return;
         }
         if self.sort_menu.is_open() {
-            self.sort_menu.draw(buf, cx(SORT_W), cy(SORT_H), &self.pal, &self.ui);
+            self.sort_menu.draw(buf, cx(SORT_W), cy(SORT_H), &self.pal, &self.ui, set);
             return;
         }
         if self.theme_menu.is_open() {
             // ThemeMenu is never resized by the app (Go doesn't either) -> 34x7.
-            self.theme_menu.draw(buf, cx(THEME_W), cy(7), &self.pal, &self.ui);
+            self.theme_menu.draw(buf, cx(THEME_W), cy(7), &self.pal, &self.ui, set);
             return;
         }
         if self.first_use {
             let (w, h) = (self.help_menu.width(), self.help_menu.height());
-            dialogs::draw_first_use(buf, cx(w), cy(h), w, h, &self.pal);
+            dialogs::draw_first_use(buf, cx(w), cy(h), w, h, &self.pal, set);
             return;
         }
         if self.typing_modal.is_open() {
-            self.typing_modal.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.ui, &self.hotkeys);
+            self.typing_modal.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.ui, &self.hotkeys, set);
             return;
         }
         if self.notify.is_open() {
-            self.notify.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.hotkeys);
+            self.notify.draw(buf, cx(MODAL_W), cy(MODAL_H), &self.pal, &self.hotkeys, set);
         }
     }
 

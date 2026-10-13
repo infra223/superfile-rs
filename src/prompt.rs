@@ -202,9 +202,10 @@ pub(crate) fn add_section_drawn(
     cw: usize,
     border_fg: Color,
     pal: &Palette,
+    set: BorderSet<'_>,
 ) {
     if sim.add_section() {
-        buf.section_divider(cx, y + 1 + sim.divider_row(), cw, BorderSet::plain(), border_fg, pal.modal_bg);
+        buf.section_divider(cx, y + 1 + sim.divider_row(), cw, set, border_fg, pal.modal_bg);
     }
 }
 
@@ -435,6 +436,7 @@ impl Prompt {
         pal: &Palette,
         ui: &Ui,
         hk: &Hotkeys,
+        set: BorderSet<'_>,
     ) {
         // Components must cover their previous frame completely.
         buf.fill(x, y, w, h, St::fg_bg(pal.modal_fg, pal.modal_bg));
@@ -450,7 +452,7 @@ impl Prompt {
             headline = PROMPT_HEADLINE,
             mode = if self.shell_mode { SHELL_MODE_STRING } else { SPF_MODE_STRING },
         );
-        buf.border_title(x, y, w, h, BorderSet::plain(), border_fg, pal.modal_bg, &title, border_fg);
+        buf.border_title(x, y, w, h, set, border_fg, pal.modal_bg, &title, border_fg);
 
         let cx = x + 1;
         let cw = w.saturating_sub(2);
@@ -481,7 +483,7 @@ impl Prompt {
             let mut hint_section_added = false;
             if self.value().is_empty() {
                 if !hint_section_added {
-                    add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+                    add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
                     hint_section_added = true;
                 }
                 let hk_label = hk.open_command_line.first().map(String::as_str).unwrap_or("");
@@ -501,7 +503,7 @@ impl Prompt {
             for (command, usage, description) in SPF_COMMANDS {
                 if command.starts_with(first) {
                     if !hint_section_added {
-                        add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+                        add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
                         hint_section_added = true;
                     }
                     put_content_line(
@@ -518,7 +520,7 @@ impl Prompt {
             }
         } else if self.value().is_empty() {
             let hk_label = hk.open_spf_prompt.first().map(String::as_str).unwrap_or("");
-            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
             put_content_line(&mut sim, buf, cx, y, cw, &format!(" '{hk_label}' - Get into SPF mode"), pal.modal_fg, pal);
         }
 
@@ -528,7 +530,7 @@ impl Prompt {
             } else {
                 (FAILURE_PREFIX, pal.error)
             };
-            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
             // Go's AddLines splits on '\n'; each physical line consumes one
             // row of section capacity (the prefix stays on the first line).
             for physical in format!(" {prefix} : {}", self.result_msg).split('\n') {
@@ -1137,7 +1139,7 @@ mod tests {
         p.set_result(false, "cd: no such file\nsecond line", true);
 
         let mut buf = RBuf::new(40, 10, Color::Black);
-        p.draw(&mut buf, 0, 0, 40, 10, true, &pal, &ui, &hk);
+        p.draw(&mut buf, 0, 0, 40, 10, true, &pal, &ui, &hk, BorderSet::plain());
         assert_eq!(buf.cell(0, 0).unwrap().ch, '╭');
         assert_eq!(buf.cell(39, 9).unwrap().ch, '╯');
         // The title is embedded in the top border.
@@ -1146,12 +1148,12 @@ mod tests {
 
         // Unfocused border.
         let mut buf2 = RBuf::new(40, 10, Color::Black);
-        p.draw(&mut buf2, 0, 0, 40, 10, false, &pal, &ui, &hk);
+        p.draw(&mut buf2, 0, 0, 40, 10, false, &pal, &ui, &hk, BorderSet::plain());
 
         // Tiny rects: no panics.
         let mut buf3 = RBuf::new(3, 2, Color::Black);
-        p.draw(&mut buf3, 0, 0, 3, 2, true, &pal, &ui, &hk);
+        p.draw(&mut buf3, 0, 0, 3, 2, true, &pal, &ui, &hk, BorderSet::plain());
         let mut buf4 = RBuf::new(1, 1, Color::Black);
-        p.draw(&mut buf4, 0, 0, 1, 1, true, &pal, &ui, &hk);
+        p.draw(&mut buf4, 0, 0, 1, 1, true, &pal, &ui, &hk, BorderSet::plain());
     }
 }

@@ -14,8 +14,8 @@
 //!     pre-clipping the view after the 2-col prompt;
 //! (7) the section divider is drawn with full box coords so the border glyphs on
 //!     that row become ├/┤ (Go GetBorder dividerIdx behavior);
-//! (8) BorderSet::plain() glyphs everywhere (house convention; theme border chars
-//!     not ported);
+//! (8) border glyphs come from the config's border_* keys via Config::border_set()
+//!     (Go DefaultLipglossBorder parity; defaults are the plain box-drawing glyphs);
 //! (9) footer-info icon fallback uses Go's AreInfoItemsTruncated condition
 //!     ((w-2)/cnt - 3 per item), then the house border_info helper does the layout;
 //! (10) the group also stores config.file_preview_width (refreshed by
@@ -36,7 +36,7 @@ use crate::panel::{
     MIN_PANEL_HEIGHT, MIN_PANEL_WIDTH, MODIFY_TIME_COLUMN_WIDTH, PanelMode,
     PERMISSIONS_COLUMN_WIDTH, FilePanel,
 };
-use crate::render::{BorderSet, RBuf, St};
+use crate::render::{RBuf, St};
 
 /// Multi-panel group: layout, focus, add/close/split, and rendering
 /// (port of Go internal/ui/filemodel + internal/ui/filepanel rendering).
@@ -296,7 +296,7 @@ impl PanelGroup {
         if w < 2 || h < 2 {
             return;
         }
-        let set = BorderSet::plain();
+        let set = config.border_set();
         let border_fg = if focused {
             pal.file_panel_border_active
         } else {
@@ -1028,6 +1028,37 @@ mod tests {
             e0.name.chars().next().unwrap(),
             "entry name not at expected column {name_x} (row {ry})"
         );
+    }
+
+    #[test]
+    fn test_draw_uses_custom_border_glyphs() {
+        // Config with all border_* keys overridden: draw must honor them
+        // instead of the hardcoded plain glyphs.
+        let mut cfg = Config::default();
+        for s in [
+            &mut cfg.border_top,
+            &mut cfg.border_bottom,
+            &mut cfg.border_left,
+            &mut cfg.border_right,
+            &mut cfg.border_top_left,
+            &mut cfg.border_top_right,
+            &mut cfg.border_bottom_left,
+            &mut cfg.border_bottom_right,
+            &mut cfg.border_middle_left,
+            &mut cfg.border_middle_right,
+        ] {
+            *s = "=".to_string();
+        }
+        let pal = test_palette();
+        let ui = test_ui(cfg.nerdfont);
+        let hk = Hotkeys::default();
+        let g = group_with(vec![entry("alpha", false, 1234)], 30, 16);
+        let mut buf = RBuf::new(30, 16, Color::Black);
+        g.draw(&mut buf, 0, 0, &pal, &ui, &cfg, &hk);
+
+        let top_row: String = (0..30).map(|i| buf.cell(i, 0).unwrap().ch).collect();
+        assert!(top_row.contains('='), "top border row has no '=': {top_row:?}");
+        assert!(!top_row.contains('─'), "top border row still has plain '─': {top_row:?}");
     }
 
     #[test]

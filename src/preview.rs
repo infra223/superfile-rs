@@ -21,8 +21,8 @@
 //!   therefore always applied, while Go skips it for chroma-lexed files).
 //! - the Kitty image protocol (ANSI half-blocks only).
 //! - Go's in-memory preview/thumbnail caches: each request recomputes.
-//! - the preview border uses the plain Unicode border set (the draw()
-//!   signature has no access to the config's custom border glyphs).
+//! - the preview border honors the config's border_* glyphs (passed in as a
+//!   `BorderSet` by the app; defaults are the plain Unicode box glyphs).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -178,6 +178,7 @@ impl Preview {
         focused: bool,
         pal: &Palette,
         ui: &Ui,
+        set: BorderSet<'_>,
     ) {
         let _ = focused;
 
@@ -186,7 +187,7 @@ impl Preview {
 
         let bordered = self.border_enabled;
         if bordered {
-            buf.border(x, y, w, h, BorderSet::plain(), pal.file_panel_border, pal.file_panel_bg);
+            buf.border(x, y, w, h, set, pal.file_panel_border, pal.file_panel_bg);
         }
         if !self.open {
             return;

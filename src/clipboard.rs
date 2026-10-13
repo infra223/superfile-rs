@@ -92,6 +92,7 @@ impl Clipboard {
         h: usize,
         pal: &Palette,
         ui: &Ui,
+        set: BorderSet<'_>,
     ) {
         // Cover previous frame.
         buf.fill(x, y, w, h, St::fg_bg(pal.footer_bg, pal.footer_bg));
@@ -101,7 +102,7 @@ impl Clipboard {
 
         // The clipboard never takes focus: plain footer border.
         let border_fg = pal.footer_border;
-        buf.border_title(x, y, w, h, BorderSet::plain(), border_fg, pal.footer_bg, "Clipboard", border_fg);
+        buf.border_title(x, y, w, h, set, border_fg, pal.footer_bg, "Clipboard", border_fg);
 
         let cx = x + 1;
         let cw = w.saturating_sub(2);

@@ -581,6 +581,7 @@ impl Sidebar {
         pal: &Palette,
         ui: &Ui,
         hk: &Hotkeys,
+        set: BorderSet<'_>,
     ) {
         if self.disabled {
             return;
@@ -595,7 +596,7 @@ impl Sidebar {
         } else {
             pal.sidebar_border
         };
-        buf.border(x, y, w, h, BorderSet::plain(), border_fg, pal.sidebar_bg);
+        buf.border(x, y, w, h, set, border_fg, pal.sidebar_bg);
 
         let cx = x + 1;
         let cw = w.saturating_sub(2);

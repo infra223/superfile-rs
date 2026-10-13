@@ -341,6 +341,7 @@ impl Zoxide {
         pal: &Palette,
         ui: &Ui,
         hk: &Hotkeys,
+        set: BorderSet<'_>,
     ) {
         let _ = hk; // Zoxide hints do not depend on hotkeys.
 
@@ -353,7 +354,7 @@ impl Zoxide {
         let border_fg = if focused { pal.modal_border } else { pal.modal_fg };
         // Go: icon.Search + icon.Space + zoxideHeadlineText.
         let title = format!("{}{}{}", ui.search, ui.space, ZOXIDE_HEADLINE);
-        buf.border_title(x, y, w, h, BorderSet::plain(), border_fg, pal.modal_bg, &title, border_fg);
+        buf.border_title(x, y, w, h, set, border_fg, pal.modal_bg, &title, border_fg);
 
         let cx = x + 1;
         let cw = w.saturating_sub(2);
@@ -366,7 +367,7 @@ impl Zoxide {
 
         if !self.available {
             // Go: AddSection(); AddLines(" Zoxide not available ...") — no input line.
-            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+            add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
             put_content_line(&mut sim, buf, cx, y, cw, NOT_AVAILABLE_MSG, pal.modal_fg, pal);
             return;
         }
@@ -382,14 +383,14 @@ impl Zoxide {
             pal.modal_fg,
             pal,
         );
-        add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal);
+        add_section_drawn(&mut sim, buf, cx, y, cw, border_fg, pal, set);
 
         if self.results.is_empty() {
             put_content_line(&mut sim, buf, cx, y, cw, NO_RESULTS_MSG, pal.modal_fg, pal);
             return;
         }
 
-        self.render_result_list(&mut sim, buf, cx, y, cw, border_fg, pal);
+        self.render_result_list(&mut sim, buf, cx, y, cw, border_fg, pal, set);
     }
 
     /// Go `renderResultList` + `renderVisibleResults` + `renderScrollIndicators`.
@@ -402,6 +403,7 @@ impl Zoxide {
         cw: usize,
         border_fg: Color,
         pal: &Palette,
+        set: BorderSet<'_>,
     ) {
         // Go's path-width budget uses the stored modal width.
         let available_path_width = self.width.saturating_sub(SCORE_COLUMN_WIDTH);
@@ -419,12 +421,12 @@ impl Zoxide {
         // Scroll indicators only when the list is longer than the window.
         if self.results.len() > MAX_VISIBLE_RESULTS {
             if self.render_index > 0 {
-                add_section_drawn(sim, buf, cx, y, cw, border_fg, pal);
+                add_section_drawn(sim, buf, cx, y, cw, border_fg, pal, set);
                 put_content_line(sim, buf, cx, y, cw, SCROLL_UP_INDICATOR, pal.modal_fg, pal);
             }
             if end_index < self.results.len() {
                 if self.render_index == 0 {
-                    add_section_drawn(sim, buf, cx, y, cw, border_fg, pal);
+                    add_section_drawn(sim, buf, cx, y, cw, border_fg, pal, set);
                 }
                 put_content_line(sim, buf, cx, y, cw, SCROLL_DOWN_INDICATOR, pal.modal_fg, pal);
             }
@@ -731,7 +733,7 @@ mod tests {
             (50.0, "/home".to_string()),
         ]);
         let mut buf = RBuf::new(50, 15, Color::Black);
-        z.draw(&mut buf, 0, 0, 50, 15, true, &pal, &ui, &hk);
+        z.draw(&mut buf, 0, 0, 50, 15, true, &pal, &ui, &hk, BorderSet::plain());
         assert_eq!(buf.cell(0, 0).unwrap().ch, '\u{256d}');
         assert_eq!(buf.cell(49, 14).unwrap().ch, '\u{256f}');
         let top: String = (0..50).map(|x| buf.cell(x, 0).unwrap().ch).collect();
@@ -744,14 +746,14 @@ mod tests {
         z2.mark_queried(1);
         z2.set_results(1, results(8));
         let mut buf2 = RBuf::new(50, 15, Color::Black);
-        z2.draw(&mut buf2, 0, 0, 50, 15, false, &pal, &ui, &hk);
+        z2.draw(&mut buf2, 0, 0, 50, 15, false, &pal, &ui, &hk, BorderSet::plain());
 
         // Unavailable.
         let mut z3 = Zoxide::new(false);
         z3.set_dimensions(50, 15);
         z3.open();
         let mut buf3 = RBuf::new(50, 15, Color::Black);
-        z3.draw(&mut buf3, 0, 0, 50, 15, true, &pal, &ui, &hk);
+        z3.draw(&mut buf3, 0, 0, 50, 15, true, &pal, &ui, &hk, BorderSet::plain());
         // The message sits on content row 1 (below the section divider at
         // row 0), i.e. absolute row 2.
         let row: String = (0..50).map(|x| buf3.cell(x, 2).unwrap().ch).collect();
@@ -759,8 +761,8 @@ mod tests {
 
         // Tiny rects: no panics.
         let mut tiny = RBuf::new(3, 2, Color::Black);
-        z.draw(&mut tiny, 0, 0, 3, 2, true, &pal, &ui, &hk);
+        z.draw(&mut tiny, 0, 0, 3, 2, true, &pal, &ui, &hk, BorderSet::plain());
         let mut tiny2 = RBuf::new(1, 1, Color::Black);
-        z.draw(&mut tiny2, 0, 0, 1, 1, true, &pal, &ui, &hk);
+        z.draw(&mut tiny2, 0, 0, 1, 1, true, &pal, &ui, &hk, BorderSet::plain());
     }
 }

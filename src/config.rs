@@ -841,4 +841,46 @@ mod tests {
         let p = t.resolve();
         assert_eq!(p.full_screen_bg, Color::Rgb(0x1e, 0x1e, 0x2e));
     }
+
+    // Interface pin: border_set() must map all 10 border_* config keys onto the
+    // BorderSet fields, and a default Config must keep the plain glyphs.
+    #[test]
+    fn test_border_set_maps_custom_config() {
+        let mut cfg = Config::default();
+        cfg.border_top = "=".into();
+        cfg.border_bottom = "_".into();
+        cfg.border_left = "|".into();
+        cfg.border_right = "!".into();
+        cfg.border_top_left = "L".into();
+        cfg.border_top_right = "R".into();
+        cfg.border_bottom_left = "l".into();
+        cfg.border_bottom_right = "r".into();
+        cfg.border_middle_left = "+".into();
+        cfg.border_middle_right = "#".into();
+        let set = cfg.border_set();
+        assert_eq!(set.top, "=");
+        assert_eq!(set.bottom, "_");
+        assert_eq!(set.left, "|");
+        assert_eq!(set.right, "!");
+        assert_eq!(set.top_left, "L");
+        assert_eq!(set.top_right, "R");
+        assert_eq!(set.bottom_left, "l");
+        assert_eq!(set.bottom_right, "r");
+        assert_eq!(set.middle_left, "+");
+        assert_eq!(set.middle_right, "#");
+
+        // No-regression line: default Config -> plain box-drawing glyphs.
+        let d = Config::default();
+        let set = d.border_set();
+        assert_eq!(set.top, "─");
+        assert_eq!(set.bottom, "─");
+        assert_eq!(set.left, "│");
+        assert_eq!(set.right, "│");
+        assert_eq!(set.top_left, "╭");
+        assert_eq!(set.top_right, "╮");
+        assert_eq!(set.bottom_left, "╰");
+        assert_eq!(set.bottom_right, "╯");
+        assert_eq!(set.middle_left, "├");
+        assert_eq!(set.middle_right, "┤");
+    }
 }

@@ -299,6 +299,7 @@ impl ProcessBar {
         focused: bool,
         pal: &Palette,
         ui: Ui,
+        set: BorderSet<'_>,
     ) {
         // House draw pattern (matches every other component).
         let border_fg = if focused {
@@ -311,7 +312,7 @@ impl ProcessBar {
             return;
         }
         buf.border_title(
-            x, y, w, h, BorderSet::plain(), border_fg, pal.footer_bg, "Processes", border_fg,
+            x, y, w, h, set, border_fg, pal.footer_bg, "Processes", border_fg,
         );
 
         let view_w = w.saturating_sub(2);
@@ -338,7 +339,7 @@ impl ProcessBar {
         // Border info: 1-based cursor position / total, right-aligned in bottom border.
         let info = format!("{}/{}", self.cursor + 1, self.processes.len());
         buf.border_info(
-            x, y, w, h, BorderSet::plain(), border_fg, pal.footer_bg, &[info.as_str()],
+            x, y, w, h, set, border_fg, pal.footer_bg, &[info.as_str()],
         );
 
         let sorted = self.sorted();

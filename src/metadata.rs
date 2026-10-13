@@ -179,6 +179,7 @@ impl Metadata {
         h: usize,
         focused: bool,
         pal: &Palette,
+        set: BorderSet<'_>,
     ) {
         buf.fill(x, y, w, h, St::fg_bg(pal.footer_bg, pal.footer_bg));
         if w < 2 || h < 2 {
@@ -191,7 +192,7 @@ impl Metadata {
         };
         buf.border_title(
             x, y, w, h,
-            BorderSet::plain(),
+            set,
             border_fg,
             pal.footer_bg,
             "Metadata",
@@ -211,7 +212,7 @@ impl Metadata {
         let info = format!("{}/{}", self.render_index + 1, len);
         buf.border_info(
             x, y, w, h,
-            BorderSet::plain(),
+            set,
             border_fg,
             pal.footer_bg,
             &[info.as_str()],

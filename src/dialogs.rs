@@ -4,8 +4,9 @@
 //! Deviations: (1) lipgloss replaced by hand-rolled wrap/center/grow pipeline replicating lipgloss v2 +
 //! ansi v0.11.7 semantics (verified from source); (2) multi-segment content lines are atomic (no wrap) and
 //! clipped to inner width — Go would wrap the last column of the typing-modal location line only in
-//! nerd-font mode; (3) BorderSet::plain() glyphs everywhere (house convention; theme border chars not
-//! ported); (4) ThemeMenu::open receives (themes, current) from the app instead of reading the theme dir
+//! nerd-font mode; (3) border glyphs come from the config's border_* keys via Config::border_set()
+//! (Go DefaultLipglossBorder parity; defaults are the plain box-drawing glyphs); (4) ThemeMenu::open
+//! receives (themes, current) from the app instead of reading the theme dir
 //! itself; (5) SpfError drops the Go `title` field (stored but never rendered); (6) HelpMenu hotkey column
 //! width = max plain display width + 2, right-aligned — equivalent to Go's byte-length-of-ANSI-string quirk
 //! because ANSI overhead is constant across rows; (7) hotkeyWorkType field omitted (dead in Go render);
@@ -167,12 +168,12 @@ fn draw_center_center(
     h: usize,
     logical_lines: &[Vec<Seg>],
     pal: &Palette,
+    set: BorderSet<'_>,
 ) {
     let Some(setup) = setup_drawer(w, h, logical_lines) else {
         return;
     };
     buf.fill(x, y, w, setup.box_h, St::fg_bg(pal.modal_bg, pal.modal_bg));
-    let set = BorderSet::plain();
     buf.border(x, y, w, setup.box_h, set, pal.modal_border, pal.modal_bg);
     let cw = w.saturating_sub(2);
     let end_x = x + w - 1;
@@ -197,12 +198,12 @@ fn draw_left_center(
     h: usize,
     logical_lines: &[Vec<Seg>],
     pal: &Palette,
+    set: BorderSet<'_>,
 ) {
     let Some(setup) = setup_drawer(w, h, logical_lines) else {
         return;
     };
     buf.fill(x, y, w, setup.box_h, St::fg_bg(pal.modal_bg, pal.modal_bg));
-    let set = BorderSet::plain();
     buf.border(x, y, w, setup.box_h, set, pal.modal_border, pal.modal_bg);
     let end_x = x + w - 1;
     for (i, segs) in setup.physical.iter().enumerate() {
@@ -226,6 +227,7 @@ fn draw_top_left_grow(
     logical_lines: &[Vec<Seg>],
     pal: &Palette,
     footer_count: &str,
+    set: BorderSet<'_>,
 ) {
     let cw = w.saturating_sub(2);
     let physical = expand_lines(logical_lines, cw);
@@ -236,7 +238,6 @@ fn draw_top_left_grow(
         return;
     }
     buf.fill(x, y, w, box_h, St::fg_bg(pal.modal_bg, pal.modal_bg));
-    let set = BorderSet::plain();
     buf.border(x, y, w, box_h, set, pal.modal_border, pal.modal_bg);
     let end_x = x + w - 1;
     for (i, segs) in physical.iter().enumerate() {
@@ -394,7 +395,7 @@ impl Notify {
     }
 
     /// 60×7, center/center, border pal.modal_border.
-    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, hk: &Hotkeys) {
+    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, hk: &Hotkeys, set: BorderSet<'_>) {
         let tip = if self.action == ConfirmAction::NoAction {
             vec![Seg {
                 text: format!(" ({}) Okay ", first_hotkey(&hk.confirm_typing)),
@@ -435,7 +436,7 @@ impl Notify {
             vec![],
             tip,
         ];
-        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal);
+        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal, set);
     }
 }
 
@@ -499,7 +500,7 @@ impl SpfError {
     }
 
     /// 60×7, center/center.
-    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, hk: &Hotkeys) {
+    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, hk: &Hotkeys, set: BorderSet<'_>) {
         let tip = vec![
             Seg {
                 text: format!(" ({}) Skip ", first_hotkey(&hk.confirm_typing)),
@@ -531,7 +532,7 @@ impl SpfError {
             vec![],
             tip,
         ];
-        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal);
+        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal, set);
     }
 }
 
@@ -609,7 +610,7 @@ impl SortMenu {
     }
 
     /// 20×4 declared, NO alignment (top-left), box GROWS (content = 8 lines → 20×10).
-    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, ui: &Ui) {
+    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, ui: &Ui, set: BorderSet<'_>) {
         let mut lines: Vec<Vec<Seg>> = vec![
             vec![Seg {
                 text: " Sort Options".to_string(),
@@ -641,7 +642,7 @@ impl SortMenu {
         }
         lines.push(vec![]); // trailing line (Go content ends with "\n")
         let count = format!("{}/{}", self.cursor + 1, SORT_OPTIONS.len());
-        draw_top_left_grow(buf, x, y, SORT_W, SORT_H, &lines, pal, &count);
+        draw_top_left_grow(buf, x, y, SORT_W, SORT_H, &lines, pal, &count, set);
     }
 }
 
@@ -804,7 +805,7 @@ impl ThemeMenu {
     }
 
     /// 34×7 declared, top-left, box GROWS.
-    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, ui: &Ui) {
+    pub fn draw(&self, buf: &mut RBuf, x: usize, y: usize, pal: &Palette, ui: &Ui, set: BorderSet<'_>) {
         let w = self.width;
         let h = self.height;
         let mut lines: Vec<Vec<Seg>> = vec![
@@ -886,7 +887,7 @@ impl ThemeMenu {
         } else {
             format!("{}/{}", self.cursor + 1, self.themes.len())
         };
-        draw_top_left_grow(buf, x, y, w, h, &lines, pal, &count);
+        draw_top_left_grow(buf, x, y, w, h, &lines, pal, &count, set);
     }
 }
 
@@ -1238,6 +1239,7 @@ impl HelpMenu {
         pal: &Palette,
         ui: &Ui,
         hk: &Hotkeys,
+        set: BorderSet<'_>,
     ) {
         let w = self.width;
         let h = self.height;
@@ -1245,7 +1247,6 @@ impl HelpMenu {
             return;
         }
         buf.fill(x, y, w, h, St::fg_bg(pal.modal_bg, pal.modal_bg));
-        let set = BorderSet::plain();
         let subtitle_count = self
             .filtered
             .iter()
@@ -1490,6 +1491,7 @@ impl TypingModal {
         pal: &Palette,
         ui: &Ui,
         hk: &Hotkeys,
+        set: BorderSet<'_>,
     ) {
         // Line 1: location (two segments, atomic)
         let preview = join_path(&self.location, self.input.value());
@@ -1540,7 +1542,7 @@ impl TypingModal {
             vec![],
             tip,
         ];
-        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal);
+        draw_center_center(buf, x, y, MODAL_W, MODAL_H, &lines, pal, set);
     }
 }
 
@@ -1556,6 +1558,7 @@ pub fn draw_first_use(
     w: usize,
     h: usize,
     pal: &Palette,
+    set: BorderSet<'_>,
 ) {
     let t = pal.sidebar_title;
     let m = pal.modal_fg;
@@ -1673,7 +1676,7 @@ pub fn draw_first_use(
         }],
         vec![],
     ];
-    draw_left_center(buf, x, y, w, h, &lines, pal);
+    draw_left_center(buf, x, y, w, h, &lines, pal, set);
 }
 
 #[cfg(test)]
